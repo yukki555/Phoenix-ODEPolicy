@@ -13,6 +13,7 @@ from wam.ode_policy.head import ActionBlock, ODEHead
 from wam.ode_policy.kitchen import ACTIVE, JointCoordinates, observation
 from wam.ode_policy.policy import KitchenPolicy
 from wam.ode_policy.runner import evaluate, replay, train
+from wam.ode_policy.calibration import audit_prior
 from wam.ode_policy.phoenix import read_prior
 from wam.model.backbones.wan22.wan_video_dit import WanVideoDiT
 from wam.model.backbones.wan22.schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -137,16 +138,26 @@ class ODETests(unittest.TestCase):
                    train=dict(seed=11, steps=1, lr=0.0001, batch_size=1, suffix_warmup_steps=0,
                               suffix_probability=1, model_boundary_probability=1),
                    sources=[dict(name="test", task="plate", episodes=2, validation=[1])])
+        cfg["instructions"] = {"plate": "Wipe the plate."}
         text = {"plate": (torch.randn(6, 16), torch.ones(6, dtype=torch.bool))}
         latent = torch.randn(1, 4, 1, 4, 12)
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()) as log, \
              patch.dict("sys.modules", {"zarr": SimpleNamespace(open_group=lambda *a, **kw: group)}), \
              patch("wam.inference.frame_joint.video_codec.encode_input_image_latents_tensor", return_value=latent), \
              patch("wam.ode_policy.phoenix.encode_input_image_latents_tensor", return_value=latent):
+            audit_file = Path(tmp) / "audit.pt"
+            audit_args = SimpleNamespace(data_root=Path(tmp), output=audit_file,
+                                         fit_windows=1, windows=1, source_profile=None)
+            audit_prior(audit_args, cfg, model, text, {"fixture": "test"})
+            result = torch.load(audit_file, weights_only=True)
+            self.assertEqual(result["fit_windows"], 1)
+            self.assertEqual(result["report"][0]["episode"], 1)
+            self.assertEqual(set(result["report"][0]["metrics"]), {"hold", "direct_slots", "fitted"})
             for family in ("ab", "c1", "c2"):
                 out = Path(tmp) / (family + ".pt")
                 args = SimpleNamespace(data_root=Path(tmp), family=family, output=out,
-                                       head_weights=out, steps=1, batch_size=1, windows=1)
+                                       head_weights=out, steps=1, batch_size=1, windows=1,
+                                       prior_audit=audit_file, prior_kind="fitted")
                 train(args, cfg, model, text, {"fixture": "test"})
                 for mode in (("a", "b", "b_stale", "phoenix") if family == "ab" else (family,)):
                     args.mode = mode

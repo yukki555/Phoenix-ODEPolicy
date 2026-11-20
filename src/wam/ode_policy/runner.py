@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import yaml
 
+from .calibration import PriorCoordinates, audit_prior, load_source
 from .head import ActionBlock, ODEHead
 from .kitchen import ACTIVE, ARMS, GRIPPERS, JointCoordinates, KitchenWindows, observation
 
@@ -65,10 +66,11 @@ def make_head(cfg, family, model):
                    hz=p["hz"], hidden_dim=p["hidden_dim"], context_dim=p["context_dim"]).to(model.device)
 
 
-def sample_inputs(sample, coordinates, texts):
+def sample_inputs(sample, coordinates, texts, prior_coords):
     task, rgb, states, reference, targets = sample
+    phoenix_state = prior_coords.state.normalized(states[0])[None]
     states = coordinates.normalized(states)[None]
-    return (observation(rgb, states[:, 0], texts[task]), states,
+    return (observation(rgb, phoenix_state, texts[task]), states,
             coordinates.normalized(reference)[None], coordinates.normalized(targets)[None])
 
 
@@ -80,6 +82,21 @@ def train(args, cfg, model, text, identity):
     data = KitchenWindows(args.data_root, cfg["sources"], "train", head.horizon)
     bounds = data.fit_train_bounds()
     coords = JointCoordinates(bounds, model.device)
+    source, affine = None, None
+    if getattr(args, "prior_audit", None):
+        audit = torch.load(args.prior_audit, map_location="cpu", weights_only=True)
+        if (audit["identity"] != identity or audit["sources"] != cfg["sources"]
+                or audit["policy"] != cfg["policy"] or audit["instructions"] != cfg["instructions"]
+                or not torch.equal(audit["bounds"], bounds)):
+            raise ValueError("Prior audit differs from current assets, data, or coordinate system")
+        source = audit["source"]
+        if args.prior_kind == "fitted":
+            affine = audit["affine"]
+        elif source is None:
+            raise ValueError("Native ARX decoding requires source statistics")
+    elif getattr(args, "source_profile", None):
+        source = load_source(args.source_profile, args.source_group, identity)
+    prior_coords = PriorCoordinates(coords, source, affine)
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg_train["lr"])
     seed = cfg_train["seed"]
     sampler, boundaries = random.Random(seed), random.Random(seed + 1)
@@ -94,9 +111,11 @@ def train(args, cfg, model, text, identity):
         total = 0.
         for _ in range(batch):
             index = sampler.randrange(len(data))
-            obs, states, reference, targets = sample_inputs(data[index], coords, text)
+            obs, states, reference, targets = sample_inputs(data[index], coords, text, prior_coords)
             prior = read_prior(model, head, obs, active=ACTIVE,
                                denoise_steps=cfg["policy"]["denoise_steps"], seed=seed + index)
+            if head.family == "ab":
+                prior = prior_coords.slots(prior)
             k = 0
             if head.family == "ab" and step >= cfg_train["suffix_warmup_steps"] and boundaries.random() < cfg_train["suffix_probability"]:
                 k = boundaries.randrange(1, head.horizon)
@@ -108,10 +127,16 @@ def train(args, cfg, model, text, identity):
             total += loss.item() / batch
         optimizer.step()
         print(json.dumps({"step": step+1, "loss": total}), flush=True)
+    save_new(dict(family=head.family, config=cfg, identity=identity, bounds=bounds,
+                  source=source, prior_affine=affine, head=head.state_dict(),
+                  steps=steps, batch_size=batch), output)
+
+
+def save_new(payload, output):
+    output.parent.mkdir(parents=True, exist_ok=True)
     temp = output.with_name(output.name + "." + uuid.uuid4().hex + ".tmp")
     try:
-        torch.save(dict(family=head.family, config=cfg, identity=identity, bounds=bounds,
-                        head=head.state_dict(), steps=steps, batch_size=batch), temp)
+        torch.save(payload, temp)
         os.link(temp, output)
     finally:
         temp.unlink(missing_ok=True)
@@ -158,6 +183,7 @@ def evaluate(args, model, text, identity):
     head.load_state_dict(saved["head"])
     head.eval()
     coords = JointCoordinates(saved["bounds"], model.device)
+    prior_coords = PriorCoordinates(coords, saved.get("source"), saved.get("prior_affine"))
     data = KitchenWindows(args.data_root, cfg["sources"], "val", head.horizon)
     # Fixed offsets per episode for paired comparisons across model families.
     totals, latencies, tick_times = {}, [], []
@@ -173,10 +199,12 @@ def evaluate(args, model, text, identity):
             sync(model.device)
             start = time.perf_counter()
             reference = coords.normalized(initial)[None]
-            obs = observation(rgb, coords.normalized(physical_states[0])[None], text[task])
+            obs = observation(rgb, prior_coords.state.normalized(physical_states[0])[None], text[task])
             prior = read_prior(model, head, obs, active=ACTIVE,
                                denoise_steps=cfg["policy"]["denoise_steps"], seed=cfg["train"]["seed"] + int(idx))
             sync(model.device)
+            if family == "ab":
+                prior = prior_coords.slots(prior)
             read = time.perf_counter()
             pred = replay(args.mode, head, prior, reference, states, tick_times=tick_times)
             physical = coords.physical(pred).cpu()
@@ -205,7 +233,7 @@ def evaluate(args, model, text, identity):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["train", "eval"])
+    parser.add_argument("operation", choices=["train", "eval", "audit-prior"])
     parser.add_argument("--config", type=Path, default=Path("configs/ode_policy/kitchen.yaml"))
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--model-config", type=Path, required=True, help="Resolved parent model configuration")
@@ -219,14 +247,31 @@ def main():
     parser.add_argument("--steps", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--windows", type=int, default=3, help="Held-out windows per episode")
+    parser.add_argument("--source-profile", type=Path, help="Parent-bound ARX scale JSON")
+    parser.add_argument("--source-group", help="Exact stats_group for the candidate ARX domain")
+    parser.add_argument("--prior-audit", type=Path, help="Reuse train-only map and input convention")
+    parser.add_argument("--prior-kind", choices=["fitted", "native"], default="fitted")
+    parser.add_argument("--raw-slot-control", action="store_true", help="Explicit legacy kitchen-scale assumption")
+    parser.add_argument("--fit-windows", type=int, default=1, help="Fit anchors per training episode")
+    parser.add_argument("--fit-episodes-per-task", type=int, help="Use evenly spaced training episodes for a pilot")
     args = parser.parse_args()
+    if bool(args.source_profile) != bool(args.source_group):
+        parser.error("Supply both --source-profile and --source-group")
+    if sum(map(bool, (args.prior_audit, args.source_profile, args.raw_slot_control))) > 1:
+        parser.error("Choose a prior audit, a source profile, or the raw control")
+    if args.operation == "audit-prior" and (not args.output or args.prior_audit):
+        parser.error("audit-prior requires a new --output and fits its own map")
+    if args.operation == "train" and not any((args.prior_audit, args.source_profile, args.raw_slot_control)):
+        parser.error("Choose the parent state scale (--source-profile/--source-group or --prior-audit); --raw-slot-control reproduces the kitchen-scale assumption")
+    if args.operation == "eval" and any((args.prior_audit, args.source_profile, args.raw_slot_control)):
+        parser.error("eval uses the head checkpoint's saved coordinates")
     if args.operation == "train" and not (args.output and args.family):
         parser.error("train requires --family and --output")
     if args.operation == "eval" and not (args.head_weights and args.mode):
         parser.error("eval requires --head-weights and --mode")
-    if any(x is not None and x < 1 for x in (args.steps, args.batch_size, args.windows)):
+    if any(x is not None and x < 1 for x in (args.steps, args.batch_size, args.windows, args.fit_windows, args.fit_episodes_per_task)):
         parser.error("counts must be positive")
-    if args.operation == "train":
+    if args.operation != "eval":
         cfg = yaml.safe_load(args.config.read_text())
     else:
         cfg = torch.load(args.head_weights, weights_only=True, map_location="cpu")["config"]
@@ -236,6 +281,8 @@ def main():
     model, text = load_assets(args, cfg)
     if args.operation == "train":
         train(args, cfg, model, text, identity)
+    elif args.operation == "audit-prior":
+        audit_prior(args, cfg, model, text, identity)
     else:
         evaluate(args, model, text, identity)
 
