@@ -1,0 +1,23 @@
+dataset: kitchen
+architecture: action_plan_residual_ode
+parent:
+  checkpoint: phoenix_joint96_256013
+  frozen: true
+  state_stats_profile: robot37_256013_arx5.json
+  state_stats_group: raw36/arx456_xt_motion_dedup_20260916/arx5
+action_prior:
+  mapping: source_physical
+training:
+  objective: action_path_mse
+  lr: 0.0001
+  batch_size: 32
+  steps: 1000
+  seed: 42
+  observation_schedule: sample_suffix_boundary
+  suffix_warmup_steps: 100
+  suffix_probability: 0.5
+  model_boundary_probability: 0.5
+evaluation:
+  executions: [block_start, latest_joint_each_tick]
+  baselines: [hold_latest]
+  paired_windows: true

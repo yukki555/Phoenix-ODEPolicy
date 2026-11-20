@@ -1,0 +1,4 @@
+policy:
+  hidden_dim: 512
+  context_dim: 128
+  solver: euler

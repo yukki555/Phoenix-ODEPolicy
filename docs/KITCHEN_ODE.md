@@ -2,6 +2,32 @@
 
 基线为本地 Phoenix-MWA 镜像中的 post-train 提交 `b91628dc3d55407ecb0fb4a19b26adf6d2c3ff32`。输入使用块首三路 RGB、任务文本和当前关节状态。每套新增参数在削黄瓜、鸡蛋翻面、切芹菜、擦盘子四任务间共享。训练与推理使用同一份冻结的 Joint96，动作输出为两臂关节和夹爪的 14 维绝对目标。
 
+## 按架构和实验配置运行
+
+| 架构 | 块首条件 | 积分变量 | Recipe |
+|---|---|---|---|
+| `action_plan_residual_ode` | 映射到厨房坐标的 Phoenix 动作块 | 相对原计划的残差 | [动作计划](../configs/ode_policy/recipes/kitchen_action_plan_residual.yaml) |
+| `action_token_ode` | 末步投影前的整段 action tokens | 14 维绝对参考 | [动作序列](../configs/ode_policy/recipes/kitchen_action_tokens.yaml) |
+| `action_query_ode` | 可学习 query 单次读取当前条件 | 14 维绝对参考 | [单次 query](../configs/ode_policy/recipes/kitchen_action_query.yaml) |
+
+先展开 recipe 即可查看数据切分、父模型、条件、积分变量、训练采样和执行协议。以下命令从仓库根目录运行。
+
+```bash
+recipe=configs/ode_policy/recipes/kitchen_action_tokens.yaml
+python -m wam.ode_policy.runner resolve --recipe "$recipe"
+common=(--model-config "$PHOENIX_MODEL_CONFIG" --phoenix-weights "$PHOENIX_WEIGHTS" --data-root "$KITCHEN_DATA_ROOT")
+python -m wam.ode_policy.runner train --recipe "$recipe" "${common[@]}" --output runs/action-tokens.pt
+python -m wam.ode_policy.runner eval "${common[@]}" --head-weights runs/action-tokens.pt --windows 3
+```
+
+最后一条命令读取 checkpoint 内的协议。对每个窗口只提取一次条件，按 `block_start`、`latest_joint_each_tick` 和 `hold_latest` 分别报告结果。单项评估可使用 `--mode latest_joint_each_tick`。部署从同一 checkpoint 恢复，然后调用 `full_chunk()` 或由控制器逐步调用 `next_target(k, measured, last_sent)`。新 checkpoint 保存解析后的 recipe、实际训练步数和 batch、父模型指纹、输入状态统计，以及残差架构实际使用的动作映射。旧 checkpoint 按保存的 family、映射和统计恢复。
+
+复制动作序列 recipe，将 `conditioning.token_reduction` 从 `none` 改成 `temporal_mean_repeat`，用新输出路径训练。均值消融先沿 32 个时间位置取均值，再重复至原长度，随后执行相同投影、位置编码和 attention。两组可共享 `--c1-cache-dir` 中的原始 tokens。训练步数、batch 和采样设置沿用同一份 recipe。
+
+残差 recipe 默认用 `source_physical`。使用拟合映射时，改为 `action_prior.mapping: fitted_affine`，并在同一区段用 `audit`（相对 recipe 的路径）指定已经生成的训练集校准文件，或传入 `--prior-audit`。三组使用相同的父模型 state 编码。仅动作计划使用 action 解码和映射。
+
+## 旧命令对应关系
+
 | 训练 family | 评估 mode | 先验及执行方式 |
 |---|---|---|
 | `c1` | `fixed`、`feedback` | 块首完整去噪一次，保存末步输出投影前的整段 action tokens |
@@ -95,7 +121,7 @@ row = trial.result(success, stage_outcomes)    # 每个 episode 保存一条 JSO
 report = summarize_pairs(completed_trial_rows)
 ```
 
-`tick` 按成功下发推进参考。下发异常后应由控制器核对最后一条已提交的目标再建立新 trial。计时从读取关节状态前到下发确认返回，另记块首输入至首目标就绪的延迟。配对汇总按任务、权重和模式列出成功数、各阶段完成数、下发异常数、P50/P95 和 33.3 ms 超周期率。真机报告需保留每个配对的原始记录。
+`tick` 按成功下发推进参考。下发异常后应由控制器核对最后一条已提交的目标再建立新 trial。计时从 tick 入口到下发确认返回，逐步反馈包含读取关节状态的耗时，固定模式直接下发已规划目标，另记块首输入至首目标就绪的延迟。配对汇总按任务、权重和模式列出成功数、各阶段完成数、下发异常数、P50/P95 和 33.3 ms 超周期率。真机报告需保留每个配对的原始记录。
 
 ## 软件验证
 

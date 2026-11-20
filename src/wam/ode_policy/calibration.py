@@ -8,7 +8,7 @@ import torch
 from .kitchen import ACTIVE, ARMS, GRIPPERS, JointCoordinates, observation
 
 
-def load_source(path, group, identity):
+def load_source(path, group, identity, *, include_action=True):
     profile = json.loads(Path(path).read_text())
     allowed = [profile["source_checkpoint_sha256"], *profile.get("release_sha256", [])]
     if profile["slots"] != ACTIVE or identity["phoenix_weights"] not in allowed:
@@ -17,7 +17,7 @@ def load_source(path, group, identity):
         raise ValueError(f"Select an explicit source group from {list(profile['groups'])}")
     row = profile["groups"][group]
     result = {"group": group, "norm_sha256": profile["norm_sha256"]}
-    for kind in ("state", "action"):
+    for kind in (("state", "action") if include_action else ("state",)):
         bounds = torch.tensor(row[kind], dtype=torch.float32)
         if bounds.shape != (2, 14) or not bounds.isfinite().all() or (bounds[1] < bounds[0]).any():
             raise ValueError(f"Invalid {kind} bounds")
@@ -63,7 +63,7 @@ class PriorCoordinates:
         self.source = source
         device = kitchen.scale.device
         self.state = JointCoordinates(source["state"], device) if source else kitchen
-        self.action = JointCoordinates(source["action"], device) if source else None
+        self.action = JointCoordinates(source["action"], device) if source and "action" in source else None
         self.affine = tuple(v.to(device) for v in affine) if affine is not None else None
 
     def slots(self, raw):

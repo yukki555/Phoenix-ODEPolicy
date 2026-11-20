@@ -4,13 +4,16 @@ import time
 import numpy as np
 import torch
 
+from .recipe import EXECUTIONS, MODE_ALIASES
+
 
 class KitchenTrial:
     """One episode. Supply a new instance after any reset or control handoff."""
 
     def __init__(self, policy, task, mode, pair_id, head_id, *, last_sent=None):
-        if mode not in {"fixed", "feedback"} or policy.head.family not in {"c1", "c2"}:
-            raise ValueError("Paired trials require a C1/C2 head and fixed or feedback mode")
+        self.execution = MODE_ALIASES.get(mode, mode)
+        if mode not in {"fixed", "feedback", *EXECUTIONS}:
+            raise ValueError("Choose block-start or per-tick execution")
         self.policy, self.task, self.mode = policy, task, mode
         self.pair_id, self.head_id = pair_id, head_id
         self.last_sent = last_sent
@@ -26,7 +29,7 @@ class KitchenTrial:
             raise ValueError("Previous block still active")
         self.started = time.perf_counter()
         block = self.policy.begin_block(self.task, rgb, measured, self.last_sent, seed=seed)
-        chunk = block.full_chunk().cpu() if self.mode == "fixed" else None
+        chunk = block.full_chunk().cpu() if self.execution == "block_start" else None
         if chunk is not None:
             self.first_target_ms.append((time.perf_counter()-self.started)*1000)
         if self.last_sent is None:
@@ -38,9 +41,8 @@ class KitchenTrial:
         if self.block is None:
             raise ValueError("No active block")
         start = time.perf_counter()
-        measured = read_state()
-        target = (self.chunk[self.k] if self.mode == "fixed"
-                  else self.block.next_target(self.k, measured, self.last_sent).cpu())
+        target = (self.chunk[self.k] if self.execution == "block_start"
+                  else self.block.next_target(self.k, read_state(), self.last_sent).cpu())
         if not target.isfinite().all():
             raise ValueError("Nonfinite physical target")
         ready = time.perf_counter()
@@ -55,7 +57,7 @@ class KitchenTrial:
             self.invalid = True
             raise
         self.tick_ms.append((completed-start)*1000)
-        if self.k == 0 and self.mode == "feedback":
+        if self.k == 0 and self.execution == "latest_joint_each_tick":
             self.first_target_ms.append((ready-self.started)*1000)
         self.last_sent = accepted.detach().clone()
         self.k += 1
@@ -79,22 +81,25 @@ def summarize_pairs(trials):
     for trial in trials:
         key = trial["family"], trial["head_id"], trial["task"], trial["pair_id"]
         pair = pairs.setdefault(key, {})
-        if trial["mode"] in pair:
+        execution = MODE_ALIASES.get(trial["mode"], trial["mode"])
+        if execution in pair:
             raise ValueError(f"Repeated trial mode for {key}")
-        pair[trial["mode"]] = trial
+        pair[execution] = trial
     groups = {}
     protocols = {}
     for (family, head_id, task, pair_id), pair in pairs.items():
-        if set(pair) != {"fixed", "feedback"}:
+        if set(pair) != set(EXECUTIONS):
             raise ValueError(f"Incomplete pair {pair_id}")
-        for mode, trial in pair.items():
+        for execution, trial in pair.items():
             group = (family, head_id, task)
             protocol = (frozenset(trial["stages"]), trial["hz"])
             if protocols.setdefault(group, protocol) != protocol:
                 raise ValueError(f"Scoring or control rate changed within {task}")
-            groups.setdefault((family, head_id, task, mode), []).append(trial)
+            groups.setdefault((family, head_id, task, execution), []).append(trial)
     result = []
-    for (family, head_id, task, mode), rows in groups.items():
+    for (family, head_id, task, execution), rows in groups.items():
+        labels = {row["mode"] for row in rows}
+        mode = labels.pop() if len(labels) == 1 else execution
         stages, hz = rows[0]["stages"].keys(), rows[0]["hz"]
         ticks = np.asarray([v for r in rows for v in r["tick_ms"]])
         first = [v for r in rows for v in r["first_target_ms"]]

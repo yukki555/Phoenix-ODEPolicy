@@ -2,33 +2,30 @@
 import torch
 from torch import nn
 
+from .architectures import architecture_type
+
 
 class ODEHead(nn.Module):
     def __init__(self, family, token_width, *, horizon=32, hz=30, hidden_dim=512, context_dim=128):
         super().__init__()
-        if family not in {"ab", "c1", "c2"} or horizon < 2 or hz <= 0:
-            raise ValueError("Invalid ODE family, horizon or control rate")
-        self.family, self.horizon, self.hz = family, horizon, hz
-        self.project = nn.Linear(14 if family == "ab" else token_width, context_dim)
-        if family == "c2":
-            self.query = nn.Parameter(torch.randn(1, 1, token_width) * 0.02)
-        else:
-            self.position = nn.Parameter(torch.randn(horizon, context_dim) * 0.02)
-            self.reader = nn.MultiheadAttention(context_dim, 1, batch_first=True)
+        if horizon < 2 or hz <= 0:
+            raise ValueError("Invalid integration horizon or control rate")
+        self.architecture = architecture_type(family)
+        self.family, self.horizon, self.hz = self.architecture.legacy, horizon, hz
+        self.token_reduction = "none"
+        self.architecture.init_reader(self, token_width, context_dim)
         self.field = nn.Sequential(
             nn.Linear(context_dim + 14 * 2 + 1, hidden_dim), nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 14),
         )
-        if family == "ab":
+        if self.architecture.integrates == "residual_to_mapped_plan":
             nn.init.zeros_(self.field[-1].weight)
             nn.init.zeros_(self.field[-1].bias)
 
     def prepare(self, prior):
-        length = 1 if self.family == "c2" else self.horizon
-        if prior.ndim != 3 or prior.shape[1:] != (length, self.project.in_features):
-            raise ValueError("Wrong prior sequence shape for this ODE family")
-        context = self.project(prior.float())
-        return context if self.family == "c2" else context + self.position
+        if prior.ndim != 3:
+            raise ValueError("Expected a batched condition sequence")
+        return self.architecture.prepare(self, prior)
 
     def integrate(self, context, prior, block_start, measured, reference, *, start=0, stop=None):
         """Return targets at ticks start+1 through stop, using fixed [B,14] or causal per-tick [B,H,14] measurements."""
@@ -40,21 +37,13 @@ class ODEHead(nn.Module):
             raise ValueError("Expected reference [B,14] and measured [B,14] or [B,H,14]")
         outputs = []
         for k in range(start, stop):
-            state = reference
-            if self.family == "ab":
-                boundary = prior[:, k-1] if k else block_start
-                state = reference - boundary
-            if self.family == "c2":
-                condition = context[:, 0]
-            else:
-                query = context[:, k:k+1]
-                read, _ = self.reader(query, context, context, need_weights=False)
-                condition = (query + read)[:, 0]
+            state = self.architecture.to_state(prior, block_start, reference, k)
+            condition = self.architecture.at_tick(self, context, k)
             phase = state.new_full((state.shape[0], 1), k / self.horizon)
             q = measured[:, k] if measured.ndim == 3 else measured
             speed = self.field(torch.cat((condition, q, state, phase), dim=-1))
             updated = state + speed / self.hz
-            reference = prior[:, k] + updated if self.family == "ab" else updated
+            reference = self.architecture.to_reference(prior, updated, k)
             outputs.append(reference)
         return torch.stack(outputs, dim=1)
 
@@ -62,8 +51,8 @@ class ODEHead(nn.Module):
         """states[:,k] is available before target k; reference is the block-start boundary."""
         context = self.prepare(prior)
         k = 0 if boundary is None else boundary
-        if not 0 <= k < self.horizon or (k and self.family != "ab"):
-            raise ValueError("Only A/B train on interior boundaries")
+        if not 0 <= k < self.horizon:
+            raise ValueError("Training boundary outside the block")
         initial = reference
         if k and model_boundary:
             with torch.no_grad():

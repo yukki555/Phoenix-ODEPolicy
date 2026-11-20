@@ -115,7 +115,7 @@ class ODETests(unittest.TestCase):
         text = {"plate": (torch.randn(6, 16), torch.ones(6, dtype=torch.bool))}
         policy = KitchenPolicy(model, self.head, coordinates, text, denoise_steps=1)
         rgb = torch.zeros(3, 3, 16, 16, dtype=torch.uint8)
-        with patch("wam.ode_policy.policy.read_prior", return_value=self.p) as prior_reader:
+        with patch("wam.ode_policy.factory.Architecture.read_condition", return_value=self.p) as prior_reader:
             block = policy.begin_block("plate", rgb, self.q[0, 0], self.a0[0])
             chunk = block.full_chunk()
             last = self.a0[0]
@@ -132,7 +132,7 @@ class ODETests(unittest.TestCase):
             head = ODEHead(family, 32, hidden_dim=32, context_dim=16)
             prior = torch.randn(1, 32 if family == "c1" else 1, 32)
             policy = KitchenPolicy(TinyPhoenix(), head, coords, text)
-            with patch("wam.ode_policy.policy.read_prior", return_value=prior) as reader:
+            with patch("wam.ode_policy.factory.Architecture.read_condition", return_value=prior) as reader:
                 block = policy.begin_block("egg", rgb, self.q[0, 0].double(), self.a0[0].double())
                 calls = []
                 def walk(change):

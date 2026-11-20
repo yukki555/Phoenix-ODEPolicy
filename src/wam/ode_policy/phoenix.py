@@ -44,13 +44,13 @@ def read_current_query(model, query, obs):
     return mix_frame_action(model, video, action, attention, video_valid, query_valid, True)["action"]
 
 
-def read_prior(model, head, obs, *, active, denoise_steps, seed):
-    if head.family == "c2":
-        return read_current_query(model, head.query, obs).float()
-    sampled = infer_frame_joint_window(
+def sample_block(model, head, obs, steps, seed, *, tokens):
+    return infer_frame_joint_window(
         model, prompt=None, **obs, num_frames=9, action_horizon=head.horizon,
-        num_inference_steps=denoise_steps, seed=seed, decode_video=False,
-        return_action_tokens=head.family == "c1")
-    if head.family == "c1":
-        return sampled["action_tokens"].float()
-    return sampled["action"][:, active].unsqueeze(0).to(model.device)
+        num_inference_steps=steps, seed=seed, decode_video=False, return_action_tokens=tokens)
+
+
+def read_prior(model, head, obs, *, active, denoise_steps, seed):
+    """Raw parent output, also used by the legacy calibration and token-cache tools."""
+    from .architectures import architecture_type
+    return architecture_type(head.family).read(model, head, obs, active, denoise_steps, seed)

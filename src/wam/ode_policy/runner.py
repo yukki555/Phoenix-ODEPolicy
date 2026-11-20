@@ -14,7 +14,11 @@ import torch
 import yaml
 
 from .calibration import PriorCoordinates, audit_prior, load_source
-from .head import ActionBlock, ODEHead
+from .head import ActionBlock
+from .factory import build_architecture, make_head, restore_architecture
+from .architectures import LEGACY_NAMES, architecture_type
+from .recipe import (EXECUTIONS, MODE_ALIASES, checkpoint_recipe, evaluation_modes, legacy_config,
+                     legacy_recipe, resolve_recipe)
 from .metrics import motion_metrics, summarize
 from .kitchen import ACTIVE, JointCoordinates, KitchenWindows, observation
 
@@ -60,14 +64,6 @@ def load_assets(args, cfg):
     return model, text
 
 
-def make_head(cfg, family, model):
-    p = cfg["policy"]
-    if p["solver"] != "euler":
-        raise ValueError("The four-way comparison uses fixed-step Euler")
-    return ODEHead(family, model.action_expert.hidden_dim, horizon=p["horizon"],
-                   hz=p["hz"], hidden_dim=p["hidden_dim"], context_dim=p["context_dim"]).to(model.device)
-
-
 def sample_inputs(sample, coordinates, texts, prior_coords):
     task, rgb, states, reference, targets = sample
     phoenix_state = prior_coords.state.normalized(states[0])[None]
@@ -96,34 +92,49 @@ def c1_training_tokens(cache_dir, model, head, obs, *, denoise_steps, seed):
     return tokens
 
 
-def train(args, cfg, model, text, identity):
-    from .phoenix import read_prior
-
-    cfg_train = cfg["train"]
-    head = make_head(cfg, args.family, model)
-    data = KitchenWindows(args.data_root, cfg["sources"], "train", head.horizon)
+def train(args, cfg, model, text, identity, *, recipe=None):
+    data = KitchenWindows(args.data_root, cfg["sources"], "train", cfg["policy"]["horizon"])
     bounds = data.fit_train_bounds()
     coords = JointCoordinates(bounds, model.device)
     source, affine = None, None
+    architecture = recipe["architecture"] if recipe is not None else args.family
+    family = architecture_type(architecture).legacy
+    needs_action_scale = family == "ab"
+    if recipe is not None:
+        parent = recipe["parent"]
+        source = load_source(parent["state_stats_profile"], parent["state_stats_group"], identity,
+                             include_action=needs_action_scale)
     if getattr(args, "prior_audit", None):
         audit = torch.load(args.prior_audit, map_location="cpu", weights_only=True)
         if (audit["identity"] != identity or audit["sources"] != cfg["sources"]
                 or audit["policy"] != cfg["policy"] or audit["instructions"] != cfg["instructions"]
                 or not torch.equal(audit["bounds"], bounds)):
             raise ValueError("Prior audit differs from current assets, data, or coordinate system")
-        source = audit["source"]
+        audit_source = audit["source"]
+        if source is not None and (audit_source is None or audit_source["group"] != source["group"]
+                                   or not all(torch.equal(audit_source[k], source[k]) for k in source if k in {"state", "action"})):
+            raise ValueError("Prior audit coordinates differ from recipe")
+        source = audit_source
         if args.prior_kind == "fitted":
             affine = audit["affine"]
         elif source is None:
             raise ValueError("Native ARX decoding requires source statistics")
-    elif getattr(args, "source_profile", None):
-        source = load_source(args.source_profile, args.source_group, identity)
+    elif recipe is None and getattr(args, "source_profile", None):
+        source = load_source(args.source_profile, args.source_group, identity, include_action=needs_action_scale)
+    spec = recipe if recipe is not None else legacy_recipe(cfg, args.family, source, affine)
+    if not needs_action_scale:
+        source = {k: v for k, v in source.items() if k != "action"} if source else None
+        affine = None
     prior_coords = PriorCoordinates(coords, source, affine)
+    arch = build_architecture(spec, model, prior_coords)
+    head = arch.head
+    cfg_train = spec["training"]
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg_train["lr"])
     seed = cfg_train["seed"]
     sampler, boundaries = random.Random(seed), random.Random(seed + 1)
     feedback_rng = random.Random(seed + 2)
-    probability = cfg_train.get("feedback_probability", 0.5)
+    schedule = cfg_train["observation_schedule"]
+    probability = cfg_train.get("per_tick_probability", 0.5)
     if not 0 <= probability <= 1:
         raise ValueError("feedback_probability must be between 0 and 1")
     mode_counts = Counter()
@@ -135,7 +146,7 @@ def train(args, cfg, model, text, identity):
         raise FileExistsError(output)
     cache_dir = getattr(args, "c1_cache_dir", None)
     if cache_dir is not None:
-        if head.family != "c1":
+        if family != "c1":
             raise ValueError("Only frozen C1 tokens can use the training token cache")
         settings = ("c1-raw-tokens-v1", identity, head.horizon, cfg["policy"]["denoise_steps"], ACTIVE)
         cache_dir = cache_dir / hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
@@ -145,28 +156,27 @@ def train(args, cfg, model, text, identity):
         for _ in range(batch):
             index = sampler.randrange(len(data))
             obs, states, reference, targets = sample_inputs(data[index], coords, text, prior_coords)
-            settings = dict(denoise_steps=cfg["policy"]["denoise_steps"], seed=seed + index)
             if cache_dir is None:
-                prior = read_prior(model, head, obs, active=ACTIVE, **settings)
+                prior = arch.read_condition(obs, seed=seed + index)
             else:
-                prior = c1_training_tokens(cache_dir, model, head, obs, **settings)
-            if head.family == "ab":
-                prior = prior_coords.slots(prior)
+                prior = c1_training_tokens(cache_dir, model, head, obs, denoise_steps=arch.denoise_steps, seed=seed + index)
             k = 0
-            if head.family == "ab" and step >= cfg_train["suffix_warmup_steps"] and boundaries.random() < cfg_train["suffix_probability"]:
+            if schedule == "sample_suffix_boundary" and step >= cfg_train["suffix_warmup_steps"] and boundaries.random() < cfg_train["suffix_probability"]:
                 k = boundaries.randrange(1, head.horizon)
-            feedback = head.family != "ab" and feedback_rng.random() < probability
-            if head.family != "ab":
+            feedback = (schedule == "latest_joint_each_tick" or
+                        (schedule == "mix_block_start_and_per_tick" and feedback_rng.random() < probability))
+            if schedule != "sample_suffix_boundary":
                 mode_counts["feedback" if feedback else "fixed"] += 1
             loss = head.path_loss(prior, states, reference, targets, boundary=k, feedback=feedback,
-                                  model_boundary=boundaries.random() < cfg_train["model_boundary_probability"])
+                                  model_boundary=boundaries.random() < cfg_train.get("model_boundary_probability", 0.5))
             if not torch.isfinite(loss):
                 raise ValueError("Nonfinite ODE path loss")
             (loss / batch).backward()
             total += loss.item() / batch
         optimizer.step()
         print(json.dumps({"step": step+1, "loss": total}), flush=True)
-    save_new(dict(family=head.family, config=cfg, identity=identity, bounds=bounds,
+    spec = {**spec, "training": {**cfg_train, "steps": steps, "batch_size": batch}}
+    save_new(dict(schema_version=2, family=family, config=cfg, recipe=spec, identity=identity, bounds=bounds,
                   source=source, prior_affine=affine, head=head.state_dict(),
                   steps=steps, batch_size=batch, training_windows=dict(mode_counts)), output)
 
@@ -197,12 +207,13 @@ def replay(mode, head, prior, reference, states, tick_times=None, *, first_ready
             first_ready.append((time.perf_counter() - started)*1000)
         return value
 
+    mode = MODE_ALIASES.get(mode, mode)
     if mode == "hold_latest":
         return output(states, first=True)
-    if mode == "phoenix":
+    if mode == "mapped_action_plan":
         return output(prior, first=True)
     block = ActionBlock(head, prior, reference)
-    if mode not in {"b", "b_stale", "feedback"}:
+    if mode not in {"b_stale", "latest_joint_each_tick"}:
         return output(block.targets(states[:, 0], reference, start=0, count=head.horizon), first=True)
     outputs = []
     for k in range(head.horizon):
@@ -220,23 +231,28 @@ def replay(mode, head, prior, reference, states, tick_times=None, *, first_ready
 
 @torch.no_grad()
 def evaluate(args, model, text, identity):
-    from .phoenix import read_prior
-
     saved = torch.load(args.head_weights, weights_only=True, map_location="cpu")
-    if saved["identity"] != identity:
-        raise ValueError("Evaluation assets differ from head training")
-    cfg = saved["config"]
-    family = saved["family"]
-    allowed = {"a", "b", "b_stale", "phoenix"} if family == "ab" else {family, "fixed", "feedback", "paired"}
-    if args.mode not in allowed | {"hold_latest"}:
-        raise ValueError("Evaluation mode is incompatible with this head family")
-    head = make_head(cfg, family, model)
-    head.load_state_dict(saved["head"])
-    head.eval()
-    coords = JointCoordinates(saved["bounds"], model.device)
-    prior_coords = PriorCoordinates(coords, saved.get("source"), saved.get("prior_affine"))
-    data = KitchenWindows(args.data_root, cfg["sources"], "val", head.horizon)
-    modes = ["fixed", "feedback", "hold_latest"] if args.mode == "paired" else [args.mode]
+    spec = checkpoint_recipe(saved)
+    requested = getattr(args, "evaluation_recipe", None)
+    if requested:
+        for key in ("architecture", "conditioning", "sources", "instructions"):
+            if requested.get(key) != spec.get(key):
+                raise ValueError(f"Evaluation recipe differs from checkpoint: {key}")
+        policy_keys = ["horizon", "hz", "solver", "hidden_dim", "context_dim"]
+        if spec["phoenix_read"] != "single_current_query":
+            policy_keys.append("denoise_steps")
+        if any(requested["policy"][key] != spec["policy"][key] for key in policy_keys):
+            raise ValueError("Evaluation integration or parent sampling settings differ from checkpoint")
+        if requested["parent"]["state_stats_group"] != spec["parent"]["state_stats_group"]:
+            raise ValueError("Evaluation state statistics differ from checkpoint")
+        if requested.get("action_prior", {}).get("mapping") != spec.get("action_prior", {}).get("mapping"):
+            raise ValueError("Evaluation action mapping differs from checkpoint")
+        spec = {**spec, "evaluation": requested["evaluation"]}
+    arch = restore_architecture(saved, model, identity)
+    prior_coords, head = arch.coordinates, arch.head
+    coords = prior_coords.kitchen
+    data = KitchenWindows(args.data_root, spec["sources"], "val", head.horizon)
+    modes = evaluation_modes(spec, args.mode)
     totals = {mode: {} for mode in modes}
     latencies = {mode: [] for mode in modes}
     tick_times = {mode: [] for mode in modes}
@@ -253,10 +269,7 @@ def evaluate(args, model, text, identity):
                 start = time.perf_counter()
                 reference = coords.normalized(initial)[None]
                 obs = observation(rgb, prior_coords.state.normalized(physical_states[0])[None], text[task])
-                prior = read_prior(model, head, obs, active=ACTIVE,
-                                   denoise_steps=cfg["policy"]["denoise_steps"], seed=cfg["train"]["seed"] + int(idx))
-                if family == "ab":
-                    prior = prior_coords.slots(prior)
+                prior = arch.read_condition(obs, seed=spec["training"]["seed"] + int(idx))
                 sync(model.device)
                 prior_ms = (time.perf_counter()-start)*1000
             for mode in modes:
@@ -294,15 +307,16 @@ def evaluate(args, model, text, identity):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["train", "eval", "audit-prior"])
-    parser.add_argument("--config", type=Path, default=Path("configs/ode_policy/kitchen.yaml"))
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--model-config", type=Path, required=True, help="Resolved parent model configuration")
-    parser.add_argument("--phoenix-weights", type=Path, required=True)
+    parser.add_argument("operation", choices=["train", "eval", "audit-prior", "resolve"])
+    parser.add_argument("--config", type=Path, help="Legacy dataset/training YAML")
+    parser.add_argument("--recipe", type=Path, help="Experiment recipe")
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--model-config", type=Path, help="Resolved parent model configuration")
+    parser.add_argument("--phoenix-weights", type=Path)
     parser.add_argument("--text-cache", type=Path, help="Existing kitchen T5 cache; otherwise encode four task prompts")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--family", choices=["ab", "c1", "c2"])
-    parser.add_argument("--mode", choices=["phoenix", "a", "b", "b_stale", "c1", "c2", "fixed", "feedback", "paired", "hold_latest"])
+    parser.add_argument("--family", choices=list(LEGACY_NAMES))
+    parser.add_argument("--mode", choices=[*EXECUTIONS, *MODE_ALIASES, "paired", "hold_latest", "b_stale", "mapped_action_plan"])
     parser.add_argument("--output", type=Path)
     parser.add_argument("--head-weights", type=Path)
     parser.add_argument("--c1-cache-dir", type=Path, help="Optional reusable frozen C1 training tokens")
@@ -317,6 +331,31 @@ def main():
     parser.add_argument("--fit-windows", type=int, default=1, help="Fit anchors per training episode")
     parser.add_argument("--fit-episodes-per-task", type=int, help="Use evenly spaced training episodes for a pilot")
     args = parser.parse_args()
+    recipe = None
+    if args.recipe:
+        if args.operation == "audit-prior" or any((args.config, args.family, args.source_profile,
+                                                   args.source_group, args.raw_slot_control)):
+            parser.error("--recipe supplies the architecture, dataset and parent coordinates")
+        recipe = resolve_recipe(args.recipe)
+        args.family = architecture_type(recipe["architecture"]).legacy
+        if args.operation == "train":
+            prior = recipe.get("action_prior", {})
+            if prior.get("mapping") == "fitted_affine":
+                args.prior_audit = args.prior_audit or prior.get("audit")
+                if not args.prior_audit:
+                    parser.error("fitted_affine requires action_prior.audit or --prior-audit")
+                args.prior_kind = "fitted"
+            elif args.prior_audit:
+                parser.error("A recipe accepts --prior-audit only for fitted_affine")
+        elif args.operation == "eval":
+            args.evaluation_recipe = recipe
+    if args.operation == "resolve":
+        if recipe is None:
+            parser.error("resolve requires --recipe")
+        print(yaml.safe_dump(recipe, sort_keys=False), end="")
+        return
+    if not (args.model_config and args.phoenix_weights and args.data_root):
+        parser.error("Supply --model-config, --phoenix-weights and --data-root")
     if args.c1_cache_dir and (args.operation != "train" or args.family != "c1"):
         parser.error("--c1-cache-dir requires train --family c1")
     if bool(args.source_profile) != bool(args.source_group):
@@ -325,26 +364,29 @@ def main():
         parser.error("Choose a prior audit, a source profile, or the raw control")
     if args.operation == "audit-prior" and (not args.output or args.prior_audit):
         parser.error("audit-prior requires a new --output and fits its own map")
-    if args.operation == "train" and not any((args.prior_audit, args.source_profile, args.raw_slot_control)):
+    if args.operation == "train" and recipe is None and not any((args.prior_audit, args.source_profile, args.raw_slot_control)):
         parser.error("Choose the parent state scale (--source-profile/--source-group or --prior-audit); --raw-slot-control reproduces the kitchen-scale assumption")
     if args.operation == "eval" and any((args.prior_audit, args.source_profile, args.raw_slot_control)):
         parser.error("eval uses the head checkpoint's saved coordinates")
     if args.operation == "train" and not (args.output and args.family):
         parser.error("train requires --family and --output")
-    if args.operation == "eval" and not (args.head_weights and args.mode):
-        parser.error("eval requires --head-weights and --mode")
+    if args.operation == "eval" and not args.head_weights:
+        parser.error("eval requires --head-weights")
     if any(x is not None and x < 1 for x in (args.steps, args.batch_size, args.windows, args.fit_windows, args.fit_episodes_per_task)):
         parser.error("counts must be positive")
-    if args.operation != "eval":
-        cfg = yaml.safe_load(args.config.read_text())
+    if args.operation == "eval":
+        saved = torch.load(args.head_weights, weights_only=True, map_location="cpu")
+        cfg = legacy_config(checkpoint_recipe(saved))
+    elif recipe is not None:
+        cfg = legacy_config(recipe)
     else:
-        cfg = torch.load(args.head_weights, weights_only=True, map_location="cpu")["config"]
+        cfg = yaml.safe_load((args.config or Path("configs/ode_policy/kitchen.yaml")).read_text())
     torch.manual_seed(cfg["train"]["seed"])
     identity = {key: digest(getattr(args, key)) for key in ("model_config", "phoenix_weights")}
     identity["text_cache"] = digest(args.text_cache) if args.text_cache else None
     model, text = load_assets(args, cfg)
     if args.operation == "train":
-        train(args, cfg, model, text, identity)
+        train(args, cfg, model, text, identity, recipe=recipe)
     elif args.operation == "audit-prior":
         audit_prior(args, cfg, model, text, identity)
     else:
