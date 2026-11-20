@@ -40,6 +40,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ode = ["zarr==3.0.10"]
 train = ["deepspeed>=0.18.5,<0.19", "torchcodec==0.5"]
 logging = ["wandb>=0.23.1,<1"]
 modelscope = ["modelscope>=1.34,<2"]

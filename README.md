@@ -38,6 +38,11 @@ Available and planned releases include:
 - [ ] RoboDojo (sim & real) *(Coming soon)*
 - [ ] Bench2Dex *(Coming soon)*
 
+## Four-task action ODE post-training
+
+This branch adds frozen-Phoenix action ODE heads for cucumber, egg, celery and plate manipulation.
+See the [training, replay and per-tick inference guide](docs/KITCHEN_ODE.md).
+
 ## Model Zoo
 
 | Model | Weights | Benchmark Performance |

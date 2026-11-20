@@ -1,0 +1,28 @@
+# Phoenix adaptations of NTUMARS/ODE-POLICY real-r1lite and wam-imagewam.
+policy:
+  horizon: 32
+  hz: 30
+  solver: euler
+  hidden_dim: 512
+  context_dim: 128
+  denoise_steps: 10
+train:
+  lr: 0.0001
+  batch_size: 32
+  steps: 1000
+  seed: 42
+  suffix_warmup_steps: 100
+  suffix_probability: 0.5
+  model_boundary_probability: 0.5
+instructions:
+  cucumber: Peel the cucumber.
+  egg: Flip the egg.
+  celery: Cut the celery.
+  plate: Wipe the plate.
+sources:
+  - {task: cucumber, name: peel_cucumber_0819_1102, episodes: 103, validation: []}
+  - {task: cucumber, name: cucumber_0830_2336, episodes: 50, validation: []}
+  - {task: cucumber, name: peel_cucumber_val_0821_1058, episodes: 10, validation: [0,1,2,3,4,5,6,7,8,9]}
+  - {task: egg, name: egg_0910_1600, episodes: 100, validation: [50,51,52,53,54]}
+  - {task: celery, name: celery_0905_1405, episodes: 105, validation: [14,81]}
+  - {task: plate, name: plate_0821_1045, episodes: 150, validation: [50,51,52,53,54]}

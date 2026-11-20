@@ -18,6 +18,37 @@ from .online_action_policy import _encode_online_condition_frame
 from .qwen_vl_cache import _get_online_vlm_pack
 
 
+def mix_frame_action(model, video_pre, action_pre, attention_mask, video_key_mask, action_key_mask, joint96):
+    video_tokens, action_tokens = video_pre["tokens"], action_pre["tokens"]
+    return model.mot(
+        embeds_all={"video": video_tokens, "action": action_tokens},
+        attention_mask=attention_mask,
+        freqs_all={
+            "video": video_pre["freqs"],
+            "action": action_pre["freqs"],
+        },
+        context_all={
+            "video": {
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            "action": {
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+        },
+        t_mod_all={
+            "video": video_pre["t_mod"],
+            "action": action_pre["t_mod"],
+        },
+        key_masks_all={
+            "video": video_key_mask,
+            "action": action_key_mask,
+        },
+        **({"query_masks_all": {"video": video_key_mask, "action": action_key_mask}} if joint96 else {}),
+    )
+
+
 @torch.no_grad()
 def infer_frame_joint_window(
     model,
@@ -48,6 +79,7 @@ def infer_frame_joint_window(
     proprio_dim_is_pad: Optional[torch.Tensor] = None,
     embodiment_ids: Optional[torch.Tensor] = None,
     decode_video: bool = True,
+    return_action_tokens: bool = False,
 ) -> dict[str, Any]:
     """Jointly denoise the future video latents and one action horizon.
 
@@ -388,32 +420,8 @@ def infer_frame_joint_window(
             for pre, valid in ((video_pre, video_key_mask), (action_pre, action_key_mask)):
                 mask = pre["context_mask"]
                 pre["context_mask"] = mask & (valid[:, :, None] if mask.ndim == 3 else valid[:, None, :, None])
-        tokens_out = model.mot(
-            embeds_all={"video": video_tokens, "action": action_tokens},
-            attention_mask=attention_mask,
-            freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
-            },
-            context_all={
-                "video": {
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
-                },
-                "action": {
-                    "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
-                },
-            },
-            t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
-            },
-            key_masks_all={
-                "video": video_key_mask,
-                "action": action_key_mask,
-            },
-            **({"query_masks_all": {"video": video_key_mask, "action": action_key_mask}} if joint96 else {}),
+        tokens_out = mix_frame_action(
+            model, video_pre, action_pre, attention_mask, video_key_mask, action_key_mask, joint96
         )
         pred_video_all = model.video_expert.post_dit(
             tokens_out["video"], video_pre
@@ -443,6 +451,7 @@ def infer_frame_joint_window(
         video_view_names=video_view_names,
     ) if decode_video else None
     return {
+        **({"action_tokens": tokens_out["action"].detach()} if return_action_tokens else {}),
         "video": frames,
         "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
     }
