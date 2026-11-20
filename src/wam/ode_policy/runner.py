@@ -7,6 +7,7 @@ from pathlib import Path
 import random
 import time
 import uuid
+from collections import Counter
 
 import numpy as np
 import torch
@@ -14,7 +15,8 @@ import yaml
 
 from .calibration import PriorCoordinates, audit_prior, load_source
 from .head import ActionBlock, ODEHead
-from .kitchen import ACTIVE, ARMS, GRIPPERS, JointCoordinates, KitchenWindows, observation
+from .metrics import motion_metrics, summarize
+from .kitchen import ACTIVE, JointCoordinates, KitchenWindows, observation
 
 
 def digest(path):
@@ -74,6 +76,26 @@ def sample_inputs(sample, coordinates, texts, prior_coords):
             coordinates.normalized(reference)[None], coordinates.normalized(targets)[None])
 
 
+def c1_training_tokens(cache_dir, model, head, obs, *, denoise_steps, seed):
+    """Content-address frozen C1 tokens; the directory identifies the parent and reader settings."""
+    from .phoenix import read_prior
+
+    key = hashlib.sha256(str(seed).encode())
+    for name in ("input_image", "proprio", "context", "context_mask"):
+        tensor = obs[name].detach().cpu().contiguous()
+        key.update(str((name, tensor.dtype, tuple(tensor.shape))).encode())
+        key.update(tensor.view(torch.uint8).numpy().tobytes())
+    path = cache_dir / key.hexdigest()[:2] / (key.hexdigest() + ".pt")
+    if path.is_file():
+        return torch.load(path, map_location=model.device, weights_only=True)
+    tokens = read_prior(model, head, obs, active=ACTIVE, denoise_steps=denoise_steps, seed=seed)
+    try:
+        save_new(tokens.detach().cpu(), path)
+    except FileExistsError:
+        pass  # Concurrent readers computed the identical frozen condition.
+    return tokens
+
+
 def train(args, cfg, model, text, identity):
     from .phoenix import read_prior
 
@@ -100,26 +122,43 @@ def train(args, cfg, model, text, identity):
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg_train["lr"])
     seed = cfg_train["seed"]
     sampler, boundaries = random.Random(seed), random.Random(seed + 1)
+    feedback_rng = random.Random(seed + 2)
+    probability = cfg_train.get("feedback_probability", 0.5)
+    if not 0 <= probability <= 1:
+        raise ValueError("feedback_probability must be between 0 and 1")
+    mode_counts = Counter()
     batch = args.batch_size or cfg_train["batch_size"]
     steps = args.steps or cfg_train["steps"]
     output = args.output
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise FileExistsError(output)
+    cache_dir = getattr(args, "c1_cache_dir", None)
+    if cache_dir is not None:
+        if head.family != "c1":
+            raise ValueError("Only frozen C1 tokens can use the training token cache")
+        settings = ("c1-raw-tokens-v1", identity, head.horizon, cfg["policy"]["denoise_steps"], ACTIVE)
+        cache_dir = cache_dir / hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
         total = 0.
         for _ in range(batch):
             index = sampler.randrange(len(data))
             obs, states, reference, targets = sample_inputs(data[index], coords, text, prior_coords)
-            prior = read_prior(model, head, obs, active=ACTIVE,
-                               denoise_steps=cfg["policy"]["denoise_steps"], seed=seed + index)
+            settings = dict(denoise_steps=cfg["policy"]["denoise_steps"], seed=seed + index)
+            if cache_dir is None:
+                prior = read_prior(model, head, obs, active=ACTIVE, **settings)
+            else:
+                prior = c1_training_tokens(cache_dir, model, head, obs, **settings)
             if head.family == "ab":
                 prior = prior_coords.slots(prior)
             k = 0
             if head.family == "ab" and step >= cfg_train["suffix_warmup_steps"] and boundaries.random() < cfg_train["suffix_probability"]:
                 k = boundaries.randrange(1, head.horizon)
-            loss = head.path_loss(prior, states, reference, targets, boundary=k,
+            feedback = head.family != "ab" and feedback_rng.random() < probability
+            if head.family != "ab":
+                mode_counts["feedback" if feedback else "fixed"] += 1
+            loss = head.path_loss(prior, states, reference, targets, boundary=k, feedback=feedback,
                                   model_boundary=boundaries.random() < cfg_train["model_boundary_probability"])
             if not torch.isfinite(loss):
                 raise ValueError("Nonfinite ODE path loss")
@@ -129,7 +168,7 @@ def train(args, cfg, model, text, identity):
         print(json.dumps({"step": step+1, "loss": total}), flush=True)
     save_new(dict(family=head.family, config=cfg, identity=identity, bounds=bounds,
                   source=source, prior_affine=affine, head=head.state_dict(),
-                  steps=steps, batch_size=batch), output)
+                  steps=steps, batch_size=batch, training_windows=dict(mode_counts)), output)
 
 
 def save_new(payload, output):
@@ -148,23 +187,34 @@ def sync(device):
 
 
 @torch.no_grad()
-def replay(mode, head, prior, reference, states, tick_times=None):
+def replay(mode, head, prior, reference, states, tick_times=None, *, first_ready=None, coordinates=None):
+    """Return normalized targets by default, or CPU physical targets for timed evaluation."""
+    started = time.perf_counter()
+    def output(target, *, first):
+        value = coordinates.physical(target).cpu() if coordinates is not None else target
+        if first and first_ready is not None:
+            sync(value.device)
+            first_ready.append((time.perf_counter() - started)*1000)
+        return value
+
+    if mode == "hold_latest":
+        return output(states, first=True)
     if mode == "phoenix":
-        return prior
+        return output(prior, first=True)
     block = ActionBlock(head, prior, reference)
-    if mode not in {"b", "b_stale"}:
-        return block.targets(states[:, 0], reference, start=0, count=head.horizon)
+    if mode not in {"b", "b_stale", "feedback"}:
+        return output(block.targets(states[:, 0], reference, start=0, count=head.horizon), first=True)
     outputs = []
     for k in range(head.horizon):
         if tick_times is not None:
             sync(reference.device)
             tick_start = time.perf_counter()
-        observed = states[:, k] if mode == "b" else states[:, 0]
+        observed = states[:, 0] if mode == "b_stale" else states[:, k]
         reference = block.targets(observed, reference, start=k, count=1)[:, 0]
+        outputs.append(output(reference, first=k == 0))
         if tick_times is not None:
             sync(reference.device)
             tick_times.append((time.perf_counter() - tick_start) * 1000)
-        outputs.append(reference)
     return torch.stack(outputs, dim=1)
 
 
@@ -177,7 +227,8 @@ def evaluate(args, model, text, identity):
         raise ValueError("Evaluation assets differ from head training")
     cfg = saved["config"]
     family = saved["family"]
-    if args.mode not in ({"a", "b", "b_stale", "phoenix"} if family == "ab" else {family}):
+    allowed = {"a", "b", "b_stale", "phoenix"} if family == "ab" else {family, "fixed", "feedback", "paired"}
+    if args.mode not in allowed | {"hold_latest"}:
         raise ValueError("Evaluation mode is incompatible with this head family")
     head = make_head(cfg, family, model)
     head.load_state_dict(saved["head"])
@@ -185,50 +236,60 @@ def evaluate(args, model, text, identity):
     coords = JointCoordinates(saved["bounds"], model.device)
     prior_coords = PriorCoordinates(coords, saved.get("source"), saved.get("prior_affine"))
     data = KitchenWindows(args.data_root, cfg["sources"], "val", head.horizon)
-    # Fixed offsets per episode for paired comparisons across model families.
-    totals, latencies, tick_times = {}, [], []
+    modes = ["fixed", "feedback", "hold_latest"] if args.mode == "paired" else [args.mode]
+    totals = {mode: {} for mode in modes}
+    latencies = {mode: [] for mode in modes}
+    tick_times = {mode: [] for mode in modes}
     for ep_index, (_, source, task, ep, _, _) in enumerate(data.episodes):
         begin = data.ends[ep_index-1] if ep_index else 0
         end = data.ends[ep_index]
         offsets = np.unique(np.linspace(begin, end-1, min(end-begin, args.windows), dtype=int))
-        errors = []
+        rows = {mode: [] for mode in modes}
         for idx in offsets:
-            sample = data[int(idx)]
-            _, rgb, physical_states, initial, _ = sample
-            states = coords.normalized(physical_states)[None]
-            sync(model.device)
-            start = time.perf_counter()
-            reference = coords.normalized(initial)[None]
-            obs = observation(rgb, prior_coords.state.normalized(physical_states[0])[None], text[task])
-            prior = read_prior(model, head, obs, active=ACTIVE,
-                               denoise_steps=cfg["policy"]["denoise_steps"], seed=cfg["train"]["seed"] + int(idx))
-            sync(model.device)
-            if family == "ab":
-                prior = prior_coords.slots(prior)
-            read = time.perf_counter()
-            pred = replay(args.mode, head, prior, reference, states, tick_times=tick_times)
-            physical = coords.physical(pred).cpu()
-            sync(model.device)
-            end_time = time.perf_counter()
-            latencies.append(((read-start)*1000, (end_time-read)*1000, (end_time-start)*1000))
-            errors.append((physical - sample[-1][None]).square().mean(dim=(0, 1)))
-        mse = torch.stack(errors).mean(0)
-        totals.setdefault(task, []).append(mse)
-        print(json.dumps(dict(source=source, episode=ep, task=task, windows=len(offsets),
-                              arm_rmse=mse[ARMS].mean().sqrt().item(),
-                              gripper_rmse=mse[GRIPPERS].mean().sqrt().item())))
-    for task, rows in totals.items():
-        mse = torch.stack(rows).mean(0)
-        print(json.dumps(dict(task=task, episodes=len(rows), arm_rmse=mse[ARMS].mean().sqrt().item(),
-                              gripper_rmse=mse[GRIPPERS].mean().sqrt().item())))
-    if tick_times:
-        print(json.dumps(dict(mode=args.mode, feedback_ticks=len(tick_times),
-                              head_tick_p50_ms=float(np.percentile(tick_times, 50)),
-                              head_tick_p95_ms=float(np.percentile(tick_times, 95)))))
-    print(json.dumps(dict(mode=args.mode, windows=len(latencies),
-                          latency_ms_columns=["observation_and_prior", "head_and_output", "total"],
-                          p50_ms=np.percentile(latencies, 50, axis=0).tolist(),
-                          p95_ms=np.percentile(latencies, 95, axis=0).tolist())))
+            _, rgb, physical_states, initial, targets = data[int(idx)]
+            if modes != ["hold_latest"]:
+                states = coords.normalized(physical_states)[None]
+                sync(model.device)
+                start = time.perf_counter()
+                reference = coords.normalized(initial)[None]
+                obs = observation(rgb, prior_coords.state.normalized(physical_states[0])[None], text[task])
+                prior = read_prior(model, head, obs, active=ACTIVE,
+                                   denoise_steps=cfg["policy"]["denoise_steps"], seed=cfg["train"]["seed"] + int(idx))
+                if family == "ab":
+                    prior = prior_coords.slots(prior)
+                sync(model.device)
+                prior_ms = (time.perf_counter()-start)*1000
+            for mode in modes:
+                if mode == "hold_latest":
+                    physical = physical_states
+                else:
+                    tick = tick_times[mode]
+                    start = time.perf_counter()
+                    ready = []
+                    pred = replay(mode, head, prior, reference, states, tick_times=tick,
+                                  first_ready=ready, coordinates=coords)
+                    physical = pred[0]
+                    head_ms = (time.perf_counter()-start)*1000
+                    latencies[mode].append((prior_ms, head_ms, prior_ms+head_ms, prior_ms+ready[0]))
+                rows[mode].append(motion_metrics(physical, targets, physical_states, saved["bounds"]))
+        for mode in modes:
+            totals[mode].setdefault(task, []).append(rows[mode])
+            print(json.dumps(dict(mode=mode, source=source, episode=ep, task=task,
+                                  window_indices=offsets.tolist(), **summarize([rows[mode]]))))
+    for mode in modes:
+        for task, episodes in totals[mode].items():
+            print(json.dumps(dict(mode=mode, task=task, **summarize(episodes))))
+        if tick_times[mode]:
+            samples = np.asarray(tick_times[mode])
+            print(json.dumps(dict(mode=mode, feedback_ticks=len(samples),
+                                  head_tick_p50_ms=float(np.percentile(samples, 50)),
+                                  head_tick_p95_ms=float(np.percentile(samples, 95)),
+                                  head_tick_deadline_miss_fraction=float(np.mean(samples > 1000/head.hz)))))
+        if latencies[mode]:
+            print(json.dumps(dict(mode=mode, windows=len(latencies[mode]),
+                                  latency_ms_columns=["observation_and_prior", "head_and_output", "total", "first_target"],
+                                  p50_ms=np.percentile(latencies[mode], 50, axis=0).tolist(),
+                                  p95_ms=np.percentile(latencies[mode], 95, axis=0).tolist())))
 
 
 def main():
@@ -241,9 +302,10 @@ def main():
     parser.add_argument("--text-cache", type=Path, help="Existing kitchen T5 cache; otherwise encode four task prompts")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--family", choices=["ab", "c1", "c2"])
-    parser.add_argument("--mode", choices=["phoenix", "a", "b", "b_stale", "c1", "c2"])
+    parser.add_argument("--mode", choices=["phoenix", "a", "b", "b_stale", "c1", "c2", "fixed", "feedback", "paired", "hold_latest"])
     parser.add_argument("--output", type=Path)
     parser.add_argument("--head-weights", type=Path)
+    parser.add_argument("--c1-cache-dir", type=Path, help="Optional reusable frozen C1 training tokens")
     parser.add_argument("--steps", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--windows", type=int, default=3, help="Held-out windows per episode")
@@ -255,6 +317,8 @@ def main():
     parser.add_argument("--fit-windows", type=int, default=1, help="Fit anchors per training episode")
     parser.add_argument("--fit-episodes-per-task", type=int, help="Use evenly spaced training episodes for a pilot")
     args = parser.parse_args()
+    if args.c1_cache_dir and (args.operation != "train" or args.family != "c1"):
+        parser.error("--c1-cache-dir requires train --family c1")
     if bool(args.source_profile) != bool(args.source_group):
         parser.error("Supply both --source-profile and --source-group")
     if sum(map(bool, (args.prior_audit, args.source_profile, args.raw_slot_control))) > 1:

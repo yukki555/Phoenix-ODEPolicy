@@ -58,9 +58,7 @@ class KitchenBlock:
 
     @torch.no_grad()
     def next_target(self, k, measured, last_sent):
-        """B: compute tick k+1. Pass the actual committed target at k in physical units."""
-        if self.block.head.family != "ab":
-            raise ValueError("Per-tick feedback requires the shared A/B head")
+        """Compute tick k+1. Pass the actual committed target at k in physical units."""
         if measured.shape != (14,) or last_sent.shape != (14,):
             raise ValueError("Expected physical joint vectors of length 14")
         result = self.block.targets(self.coordinates.normalized(measured)[None],

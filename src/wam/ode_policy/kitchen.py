@@ -68,7 +68,7 @@ class JointCoordinates:
         self.offset = torch.where(span >= 1e-4, -1 - self.scale * lo, -lo)
 
     def normalized(self, physical):
-        return physical.to(self.scale.device) * self.scale + self.offset
+        return physical.to(self.scale) * self.scale + self.offset
 
     def physical(self, normalized):
         return (normalized - self.offset) / self.scale

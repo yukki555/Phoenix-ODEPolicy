@@ -4,12 +4,15 @@
 
 | 训练 family | 评估 mode | 先验及执行方式 |
 |---|---|---|
+| `c1` | `fixed`、`feedback` | 块首完整去噪一次，保存末步输出投影前的整段 action tokens |
+| `c2` | `fixed`、`feedback` | 块首用单个可学习 query 读取一次当前条件，复用同一条件向量 |
+| 两种 C head | `paired` | 一次读取条件，在相同窗口用同一 checkpoint 评估固定、逐步反馈和保持最新姿态 |
 | `ab` | `phoenix` | 原始 Phoenix 动作计划，对照组 |
 | `ab` | `a` | 使用原计划和块首关节状态，沿整段时域积分残差 |
 | `ab` | `b` | 使用同一份计划和同一套权重，每个控制周期读取最新实测关节，只生成下一个目标 |
 | `ab` | `b_stale` | 同样逐步调用，持续使用块首关节状态 |
-| `c1` | `c1` | 完整去噪，读取最后一次输出投影前的整段 action token，再积分生成绝对参考 |
-| `c2` | `c2` | 单个可学习 query 与当前帧走一次冻结的 MoT，从条件向量积分生成绝对参考 |
+
+C1 同一 checkpoint 的固定与反馈执行是首轮主对照。C2 使用同一协议，同时比较从块首观测到首个可执行目标的延迟。旧的 `--mode c1` 和 `--mode c2` 仍对应各自的固定状态执行。A/B 作为显式动作先验对照保留。
 
 ## 配置和数据
 
@@ -17,7 +20,7 @@
 
 数据根目录下需有 YAML 列出的六个来源，每个包含 `replay_buffer.zarr`。reader 仅读当前帧的原始三视角 RGB、`state_30hz` 和 `action_30hz` 的前 14 维。训练 496 个 episode，留出 22 个。窗口以第 k 帧为起点，监督 action[k ... k+31]，对应 state[k+1 ... k+32]；末行的重复终点排除在监督之外。非首帧用同一 episode 的 action[k−1] 作为上一目标的代理，首帧用实测关节。使用训练 episode 动作的 1%/99% 分位拟合 14 维坐标变换，正常数值范围线性映射到 [-1,1]，保留超出范围的动作。各 ODE head 共用厨房坐标；冻结 Phoenix 的输入状态另按所选来源的 state 统计变换后填入 canonical80。A/B 的动作先验按来源 action 统计逆变换到物理空间再转入厨房坐标，也可使用仅在训练 episode 上拟合的逐维仿射映射。
 
-A/B 初始输出等于原计划。默认先训练 100 个整块更新，然后以 0.5 概率抽块内边界；其中等概率选取示范上一参考或模型预测前缀的末目标。前缀预测停止梯度，后缀从当前实测关节取得条件，只监督剩余有效步。C1 与 C2 均从绝对参考直接积分。C2 的单次读取使用固定的干净视觉时刻和零动作扩散时刻；ODE 每次调用使用块内实际进度。
+A/B 初始输出等于原计划。默认先训练 100 个整块更新，然后以 0.5 概率抽块内边界；其中等概率选取示范上一参考或模型预测前缀的末目标。前缀预测停止梯度，后缀从当前实测关节取得条件，只监督剩余有效步。C1/C2 从绝对参考递推 32 步。每个训练窗口以 `train.feedback_probability` 的概率逐步使用 q[k]，其余窗口复用 q[0]。默认 0.5，设为 0 或 1 可单独训练一种方式。两种方式均把模型预测接到下一步，使用相同全轨迹 MSE。checkpoint 中的 `training_windows` 记录实际混合数。C2 的单次读取使用固定的干净视觉时刻和零动作扩散时刻；ODE 每次调用使用块内实际进度。
 
 ## 父权重与先验尺度
 
@@ -37,6 +40,12 @@ F15 的双臂关节和夹爪监督是下一观测的位置。相同的 embodimen
 pip install -e '.[ode]'
 common=(--data-root /mnt/workspace/zyh/data --model-config "$PHOENIX_MODEL_CONFIG" --phoenix-weights "$PHOENIX_WEIGHTS")
 profile=(--source-profile configs/ode_policy/robot37_256013_arx5.json --source-group raw36/arx456_xt_motion_dedup_20260916/arx5)
+for family in c1 c2; do
+    python -m wam.ode_policy.runner train "${common[@]}" "${profile[@]}" --family "$family" --output "runs/$family.pt"
+    python -m wam.ode_policy.runner eval "${common[@]}" --head-weights "runs/$family.pt" --mode paired --windows 3
+done
+
+# 次级动作先验对照
 python -m wam.ode_policy.runner audit-prior "${common[@]}" "${profile[@]}" --fit-windows 1 --windows 3 --output runs/ab-prior.pt
 python -m wam.ode_policy.runner train "${common[@]}" --prior-audit runs/ab-prior.pt --prior-kind fitted --family ab --steps 1 --batch-size 1 --output runs/ab-smoke.pt
 python -m wam.ode_policy.runner eval "${common[@]}" --head-weights runs/ab-smoke.pt --mode b --windows 1
@@ -44,9 +53,13 @@ python -m wam.ode_policy.runner eval "${common[@]}" --head-weights runs/ab-smoke
 
 A/B 可用 `--prior-kind native` 复用审计中的来源统计，或用 `--prior-kind fitted` 使用其训练集映射。C1/C2 可独立传入相同的 `--source-profile` 和 `--source-group`；两组只使用 state 编码。显式 `--raw-slot-control` 可复现旧的厨房尺度假设。部署时用 `KitchenPolicy.from_checkpoint` 恢复训练时的 state 和 action 映射。
 
+重复 C1 训练时可以传入 `--c1-cache-dir runs/c1-tokens`。缓存保存冻结骨干输出投影前的原始 tokens，按父模型身份、时域、去噪设置、种子和实际条件内容区分。C2 每个窗口都重新计算 query 条件并反向传播；计时回放始终现场计算块首条件。
+
 正式比较分别以 `--family ab`、`--family c1`、`--family c2` 训练，使用独立输出文件。相同随机种子产生相同训练窗口顺序。每个样本独立做 Phoenix 前向，用梯度累积达到配置中的有效 batch。checkpoint 保存新增权重、实际更新数、归一化、配置和父配置/权重/文本缓存指纹。训练不覆盖已有输出。评估每个留出 episode 选相同的均匀分布窗口，逐任务报告 12 臂关节和 2 夹爪的原生单位 RMSE，各 episode 等权。默认每条轨迹三个窗口。
 
-回放计时从已读入内存的观测预处理开始，输出条件读取、head 到动作输出及总耗时 P50/P95；包括首次调用。B 单列逐 tick 的 head 耗时。B 的离线反馈来自示范实测状态，离线延迟不含相机采集、网络和控制器开销。真机成功率、实时控制周期及后缀纠偏能力需要单独评估。
+配对回放的 `hold_latest` 直接输出各步 q[k]。在该数据中增量误差 (预测−q[k])−(标签−q[k]) 等于位置误差，因此另报活动关节的增量方向、预测及专家的平均绝对步长。按关节、按窗口报告活动范围与主要转折。活动阈值取该关节训练分位跨度的 1%（下限 1e-6）。主要转折取相对两端均有最大突出幅度的内部峰或谷，超过阈值才计数，比较同类型转折的时刻。夹爪沿用每窗、每侧、每方向首次越过训练区间中点的计数。时机指标都附分母，零匹配显示 null。位置 RMSE 按 episode 等权，运动统计按有效样本或事件计权。
+
+四列回放延迟分别为观测预处理与条件读取、head 至整块物理目标、两者合计、首个可用物理目标。配对模式复用块首耗时，反馈还报告单 tick 至 CPU 目标的 P50/P95 和超周期比例。离线回放使用示范状态。真机传感器读取、通信和控制器接收耗时由现场接口测量。
 
 ## 在线调用
 
@@ -57,19 +70,37 @@ block = policy.begin_block(task, rgb, measured_q, last_sent)
 chunk = block.full_chunk()  # A/C1/C2，形状 [32, 14]
 ```
 
-B 的首帧没有既有目标时令 last_sent 等于实测状态。每次获得新关节状态后只计算一个目标，按实际成功下发的目标推进 k 和 last_sent。
+B、C1 和 C2 的首帧没有既有目标时令 last_sent 等于实测状态。每次获得新关节状态后只计算一个目标，按实际成功下发的目标推进 k 和 last_sent。
 
 ```python
 block = policy.begin_block(task, rgb, measured_q, last_sent)
 target = block.next_target(k, latest_measured_q, last_sent)  # 形状 [14]
 ```
 
-块内始终复用原计划 p。在第 k 个边界用 r = last_sent − p[k] 接续，块首 p[0] 定义为块首参考。32 次反馈各执行一个 Euler 步。该接口返回物理目标张量，机器人通信由部署侧持有。
+A/B 块内始终复用原计划 p。在第 k 个边界用 r = last_sent − p[k] 接续，块首 p[0] 定义为块首参考。32 次反馈各执行一个 Euler 步。该接口返回物理目标张量，机器人通信由部署侧持有。
+
+### 真机配对记录
+
+首批用 C1，相同任务、初始物体布局、工具、checkpoint 和块首种子作为一对，按对交替先运行 fixed 或 feedback。每次 episode 各自重置，沿用现场控制器的时钟、限位和接管。上线前先看留出集的活动范围、转折与夹爪事件，再在部署机影子执行检查 30 Hz 周期。四任务分别固定阶段判据，例如削黄瓜的有效削皮行程、翻蛋的翻面、切芹菜的切断、擦盘子的有效覆盖。现场评分按同一组布尔阶段标签和任务成功判据记录。
+
+```python
+from wam.ode_policy.trial import KitchenTrial, summarize_pairs
+
+trial = KitchenTrial(policy, task, mode, pair_id, head_checkpoint_sha256, last_sent=last_sent)
+trial.begin_block(rgb, measured_q)             # 每个块开始时调用
+trial.tick(read_state, send_and_ack_target)    # 每个控制 tick 调用一次
+# 安装在现场控制器内。read_state 返回最新 14 维张量，
+# send_and_ack_target 返回实际已接受的 14 维物理目标（含控制器限幅）。
+row = trial.result(success, stage_outcomes)    # 每个 episode 保存一条 JSON
+report = summarize_pairs(completed_trial_rows)
+```
+
+`tick` 按成功下发推进参考。下发异常后应由控制器核对最后一条已提交的目标再建立新 trial。计时从读取关节状态前到下发确认返回，另记块首输入至首目标就绪的延迟。配对汇总按任务、权重和模式列出成功数、各阶段完成数、下发异常数、P50/P95 和 33.3 ms 超周期率。真机报告需保留每个配对的原始记录。
 
 ## 软件验证
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -p 'test_ode_policy.py'
+PYTHONPATH=src python -m unittest discover -s tests -p 'test_ode*.py'
 ```
 
 测试使用缩小维度的原生 Phoenix video/action expert、MoT 和 scheduler，替代视觉 codec 输入；覆盖共享 head、B 的速度场调用次数、C1 与原采样的一致性、C2 的单次读取与 query 梯度，以及小样本的训练、保存和回放。

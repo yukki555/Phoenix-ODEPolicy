@@ -11,6 +11,7 @@ train:
   batch_size: 32
   steps: 1000
   seed: 42
+  feedback_probability: 0.5
   suffix_warmup_steps: 100
   suffix_probability: 0.5
   model_boundary_probability: 0.5

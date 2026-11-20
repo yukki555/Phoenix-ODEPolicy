@@ -11,8 +11,10 @@ import torch
 
 from wam.ode_policy.head import ActionBlock, ODEHead
 from wam.ode_policy.kitchen import ACTIVE, JointCoordinates, observation
+from wam.ode_policy.metrics import motion_metrics, summarize
+from wam.ode_policy.trial import KitchenTrial, summarize_pairs
 from wam.ode_policy.policy import KitchenPolicy
-from wam.ode_policy.runner import evaluate, replay, train
+from wam.ode_policy.runner import c1_training_tokens, evaluate, replay, train
 from wam.ode_policy.calibration import audit_prior
 from wam.ode_policy.phoenix import read_prior
 from wam.model.backbones.wan22.wan_video_dit import WanVideoDiT
@@ -122,6 +124,93 @@ class ODETests(unittest.TestCase):
                 torch.testing.assert_close(last, chunk[k], rtol=2e-5, atol=2e-5)
             self.assertEqual(prior_reader.call_count, 1)
 
+    def test_causal_rollout_and_physical_feedback(self):
+        coords = JointCoordinates(torch.stack((torch.arange(14), torch.arange(14) + 3)), "cpu")
+        rgb = torch.zeros(3, 3, 16, 16, dtype=torch.uint8)
+        text = {"egg": (torch.zeros(6, 16), torch.ones(6, dtype=torch.bool))}
+        for family in ("c1", "c2"):
+            head = ODEHead(family, 32, hidden_dim=32, context_dim=16)
+            prior = torch.randn(1, 32 if family == "c1" else 1, 32)
+            policy = KitchenPolicy(TinyPhoenix(), head, coords, text)
+            with patch("wam.ode_policy.policy.read_prior", return_value=prior) as reader:
+                block = policy.begin_block("egg", rgb, self.q[0, 0].double(), self.a0[0].double())
+                calls = []
+                def walk(change):
+                    last = self.a0[0]
+                    path = []
+                    for k in range(32):
+                        q = self.q[0, k] if change and k >= 9 else self.q[0, 0]
+                        last = block.next_target(k, q, last)
+                        path.append(last)
+                    return torch.stack(path)
+                with head.field.register_forward_hook(lambda *args: calls.append(1)):
+                    fixed = block.full_chunk()
+                    stale = walk(False)
+                    changed = walk(True)
+                self.assertEqual((len(calls), reader.call_count), (96, 1))
+                torch.testing.assert_close(stale, fixed, atol=2e-5, rtol=2e-5)
+                torch.testing.assert_close(stale[:9], changed[:9])
+                self.assertFalse(torch.allclose(changed[9], stale[9]))
+                for mode in ("fixed", "feedback"):
+                    predicted = replay(mode, head, prior, self.a0, self.q)
+                    loss = head.path_loss(prior, self.q, self.a0, self.p, feedback=(mode == "feedback"))
+                    torch.testing.assert_close(loss, (predicted-self.p).square().mean())
+
+    def test_c1_cache_keys_actual_conditions(self):
+        model = TinyPhoenix()
+        head = ODEHead("c1", 32, hidden_dim=32, context_dim=16)
+        text = torch.randn(6, 16), torch.ones(6, dtype=torch.bool)
+        obs = observation(torch.zeros(3, 3, 16, 16, dtype=torch.uint8), self.q[:, 0], text)
+        obs["context"] = obs["context"].bfloat16()
+        with tempfile.TemporaryDirectory() as tmp, patch("wam.ode_policy.phoenix.read_prior", return_value=self.p) as read:
+            def fetch(seed):
+                return c1_training_tokens(Path(tmp), model, head, obs, denoise_steps=2, seed=seed)
+            torch.testing.assert_close(fetch(12), fetch(12))
+            obs["proprio"] = obs["proprio"] + 1
+            fetch(12)
+            fetch(13)
+            self.assertEqual(read.call_count, 3)
+
+    def test_motion_baseline_and_turn(self):
+        states = torch.zeros(4, 14)
+        states[:, 0] = torch.tensor([0., 1., 2., 1.])
+        target = torch.cat((states[1:], states[:1]))
+        target[:, 6] = torch.tensor([0., 1., 1., 0.])
+        bounds = torch.stack((torch.zeros(14), torch.ones(14)))
+        hold = summarize([[motion_metrics(states, target, states, bounds)]])
+        oracle = summarize([[motion_metrics(target, target, states, bounds)]])
+        self.assertEqual((hold["direction_accuracy"], hold["mean_pred_step_rad"]), (0, 0))
+        self.assertEqual((oracle["direction_accuracy"], oracle["matched_turns"], oracle["turn_timing_mae_ticks"]), (1, 1, 0))
+        self.assertEqual((oracle["matched_crossings"], hold["missed_crossings"]), (2, 2))
+
+    def test_paired_controller_dispatch_and_scoring(self):
+        from unittest.mock import Mock
+        head = SimpleNamespace(horizon=2, hz=30, family="c1")
+        policy = Mock(head=head)
+        block = policy.begin_block.return_value
+        q = torch.zeros(14)
+        block.full_chunk.return_value = torch.zeros(2, 14)
+        block.next_target.return_value = q
+        trials = []
+        for mode in ("fixed", "feedback"):
+            trial = KitchenTrial(policy, "egg", mode, "setup1", "same-checkpoint")
+            trial.begin_block(None, q)
+            trial.tick(lambda: q, lambda t: t+0.1)
+            trial.tick(lambda: q, lambda t: t+0.2)
+            if mode == "feedback":
+                torch.testing.assert_close(block.next_target.call_args.args[2], q+0.1)
+            trial.begin_block(None, q)
+            torch.testing.assert_close(policy.begin_block.call_args.args[3], q+0.2)
+            trials.append(trial.result(True, {"flip": True}))
+        result = summarize_pairs(trials)
+        self.assertEqual([(r["ticks"], r["successes"], r["stages"]["flip"]) for r in result], [(2, 1, 1)]*2)
+        with self.assertRaises(ValueError):
+            summarize_pairs(trials[:1])
+        with self.assertRaises(ValueError):
+            trial.tick(lambda: q, lambda t: None)
+        with self.assertRaises(ValueError):
+            trial.begin_block(None, q)
+
     def test_train_save_and_replay(self):
         torch.manual_seed(43)
         model = TinyPhoenix()
@@ -159,10 +248,12 @@ class ODETests(unittest.TestCase):
                                        head_weights=out, steps=1, batch_size=1, windows=1,
                                        prior_audit=audit_file, prior_kind="fitted")
                 train(args, cfg, model, text, {"fixture": "test"})
-                for mode in (("a", "b", "b_stale", "phoenix") if family == "ab" else (family,)):
+                for mode in (("a", "b", "b_stale", "phoenix") if family == "ab" else (family, "paired")):
                     args.mode = mode
                     evaluate(args, model, text, {"fixture": "test"})
             self.assertIn('"feedback_ticks": 4', log.getvalue())
+            self.assertIn('"mode": "hold_latest"', log.getvalue())
+            self.assertIn('"first_target"', log.getvalue())
             self.assertTrue(all(p.grad is None for p in model.parameters()))
 
 

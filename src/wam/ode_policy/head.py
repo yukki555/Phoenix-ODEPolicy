@@ -31,12 +31,13 @@ class ODEHead(nn.Module):
         return context if self.family == "c2" else context + self.position
 
     def integrate(self, context, prior, block_start, measured, reference, *, start=0, stop=None):
-        """Return targets at ticks start+1 through stop, holding measured fixed."""
+        """Return targets at ticks start+1 through stop, using fixed [B,14] or causal per-tick [B,H,14] measurements."""
         stop = self.horizon if stop is None else stop
         if not 0 <= start < stop <= self.horizon:
             raise ValueError("Expected a nonempty interval within the original block")
-        if measured.shape != reference.shape or measured.shape != (context.shape[0], 14):
-            raise ValueError("Expected independent measured and reference arrays [B,14]")
+        batch = context.shape[0]
+        if reference.shape != (batch, 14) or measured.shape not in {(batch, 14), (batch, self.horizon, 14)}:
+            raise ValueError("Expected reference [B,14] and measured [B,14] or [B,H,14]")
         outputs = []
         for k in range(start, stop):
             state = reference
@@ -50,13 +51,14 @@ class ODEHead(nn.Module):
                 read, _ = self.reader(query, context, context, need_weights=False)
                 condition = (query + read)[:, 0]
             phase = state.new_full((state.shape[0], 1), k / self.horizon)
-            speed = self.field(torch.cat((condition, measured, state, phase), dim=-1))
+            q = measured[:, k] if measured.ndim == 3 else measured
+            speed = self.field(torch.cat((condition, q, state, phase), dim=-1))
             updated = state + speed / self.hz
             reference = prior[:, k] + updated if self.family == "ab" else updated
             outputs.append(reference)
         return torch.stack(outputs, dim=1)
 
-    def path_loss(self, prior, states, reference, targets, *, boundary=None, model_boundary=True):
+    def path_loss(self, prior, states, reference, targets, *, boundary=None, model_boundary=True, feedback=False):
         """states[:,k] is available before target k; reference is the block-start boundary."""
         context = self.prepare(prior)
         k = 0 if boundary is None else boundary
@@ -68,7 +70,8 @@ class ODEHead(nn.Module):
                 initial = self.integrate(context, prior, reference, states[:, 0], reference, stop=k)[:, -1]
         elif k:
             initial = targets[:, k-1]
-        prediction = self.integrate(context, prior, reference, states[:, k], initial, start=k)
+        measured = states if feedback else states[:, k]
+        prediction = self.integrate(context, prior, reference, measured, initial, start=k)
         return nn.functional.mse_loss(prediction, targets[:, k:])
 
 
