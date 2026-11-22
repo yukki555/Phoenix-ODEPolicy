@@ -53,4 +53,7 @@ def sample_block(model, head, obs, steps, seed, *, tokens):
 def read_prior(model, head, obs, *, active, denoise_steps, seed):
     """Raw parent output, also used by the legacy calibration and token-cache tools."""
     from .architectures import architecture_type
-    return architecture_type(head.family).read(model, head, obs, active, denoise_steps, seed)
+    reader = getattr(head, "architecture", None)
+    if reader is None:
+        reader = architecture_type(head.family)
+    return reader.read(model, head, obs, active, denoise_steps, seed)

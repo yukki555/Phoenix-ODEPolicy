@@ -1,4 +1,4 @@
-"""Train or replay the shared A/B, C1 and C2 heads on the four kitchen tasks."""
+"""Train and evaluate kitchen action ODE heads from an experiment recipe."""
 import argparse
 import hashlib
 import json
@@ -14,12 +14,12 @@ import torch
 import yaml
 
 from .calibration import PriorCoordinates, audit_prior, load_source
-from .head import ActionBlock
 from .factory import build_architecture, make_head, restore_architecture
-from .architectures import LEGACY_NAMES, architecture_type
-from .recipe import (EXECUTIONS, MODE_ALIASES, checkpoint_recipe, evaluation_modes, legacy_config,
+from .architectures import ARCHITECTURES, ActionPlanResidual, ActionTokens, architecture_type
+from .recipe import (EXECUTIONS, HISTORY_CONTROLS, LATENT_CONTROLS, MODE_ALIASES, checkpoint_recipe, evaluation_modes, legacy_config,
                      legacy_recipe, resolve_recipe)
 from .metrics import motion_metrics, summarize
+from .replay import feedback_action_probe, replay, sync
 from .kitchen import ACTIVE, JointCoordinates, KitchenWindows, observation
 
 
@@ -72,8 +72,8 @@ def sample_inputs(sample, coordinates, texts, prior_coords):
             coordinates.normalized(reference)[None], coordinates.normalized(targets)[None])
 
 
-def c1_training_tokens(cache_dir, model, head, obs, *, denoise_steps, seed):
-    """Content-address frozen C1 tokens; the directory identifies the parent and reader settings."""
+def cached_action_tokens(cache_dir, model, head, obs, *, denoise_steps, seed):
+    """Content-address frozen action tokens; the directory identifies the parent and reader settings."""
     from .phoenix import read_prior
 
     key = hashlib.sha256(str(seed).encode())
@@ -92,14 +92,45 @@ def c1_training_tokens(cache_dir, model, head, obs, *, denoise_steps, seed):
     return tokens
 
 
+# Historical API used by existing experiment scripts.
+c1_training_tokens = cached_action_tokens
+
+
+def initialize_from_direct_action_tokens(head, path, spec, identity, source, bounds):
+    """Initialize a frozen-head adapter experiment from the matched direct action-token head."""
+    saved = torch.load(path, weights_only=True, map_location="cpu")
+    base = checkpoint_recipe(saved)
+    conditioning = base.get("conditioning", {})
+    if (base["architecture"] != "action_token_ode" or conditioning.get("feedback_route", "direct") != "direct"
+            or conditioning.get("token_reduction", "none") != spec["conditioning"]["token_reduction"]):
+        raise ValueError("Expected a direct action-token checkpoint with matching token reduction")
+    if (saved["identity"] != identity or any(base[key] != spec[key] for key in ("sources", "instructions"))
+            or any(base["policy"][key] != value for key, value in spec["policy"].items())):
+        raise ValueError("Base action-token parent, dataset or policy differs from the latent feedback recipe")
+    original = saved.get("source")
+    if (not torch.equal(saved["bounds"], bounds) or original is None or original["group"] != source["group"]
+            or not torch.equal(original["state"], source["state"])):
+        raise ValueError("Base action-token coordinates differ from adapter training")
+    adapter_keys = {"feedback_adapter." + k for k in head.feedback_adapter.state_dict()}
+    if saved["head"].keys() != head.state_dict().keys() - adapter_keys:
+        raise ValueError("Base checkpoint must contain exactly the direct action-token parameters")
+    head.load_state_dict({**head.state_dict(), **saved["head"]})
+    return digest(path)
+
+
+initialize_from_direct_c1 = initialize_from_direct_action_tokens
+
+
 def train(args, cfg, model, text, identity, *, recipe=None):
     data = KitchenWindows(args.data_root, cfg["sources"], "train", cfg["policy"]["horizon"])
     bounds = data.fit_train_bounds()
     coords = JointCoordinates(bounds, model.device)
     source, affine = None, None
-    architecture = recipe["architecture"] if recipe is not None else args.family
-    family = architecture_type(architecture).legacy
-    needs_action_scale = family == "ab"
+    name = recipe["architecture"] if recipe is not None else getattr(args, "architecture", None)
+    if name is None:
+        name = args.family  # Programmatic callers of the legacy trainer.
+    architecture = architecture_type(name)
+    needs_action_scale = isinstance(architecture, ActionPlanResidual)
     if recipe is not None:
         parent = recipe["parent"]
         source = load_source(parent["state_stats_profile"], parent["state_stats_group"], identity,
@@ -121,7 +152,7 @@ def train(args, cfg, model, text, identity, *, recipe=None):
             raise ValueError("Native ARX decoding requires source statistics")
     elif recipe is None and getattr(args, "source_profile", None):
         source = load_source(args.source_profile, args.source_group, identity, include_action=needs_action_scale)
-    spec = recipe if recipe is not None else legacy_recipe(cfg, args.family, source, affine)
+    spec = recipe if recipe is not None else legacy_recipe(cfg, architecture.name, source, affine)
     if not needs_action_scale:
         source = {k: v for k, v in source.items() if k != "action"} if source else None
         affine = None
@@ -129,7 +160,11 @@ def train(args, cfg, model, text, identity, *, recipe=None):
     arch = build_architecture(spec, model, prior_coords)
     head = arch.head
     cfg_train = spec["training"]
-    optimizer = torch.optim.AdamW(head.parameters(), lr=cfg_train["lr"])
+    if head.feedback_adapter is not None:
+        base_weights = getattr(args, "base_action_token_weights", None) or getattr(args, "base_c1_weights", None)
+        base_sha = initialize_from_direct_action_tokens(head, base_weights, spec, identity, source, bounds)
+        cfg_train = {**cfg_train, "base_c1_sha256": base_sha}
+    optimizer = torch.optim.AdamW((p for p in head.parameters() if p.requires_grad), lr=cfg_train["lr"])
     seed = cfg_train["seed"]
     sampler, boundaries = random.Random(seed), random.Random(seed + 1)
     feedback_rng = random.Random(seed + 2)
@@ -144,10 +179,10 @@ def train(args, cfg, model, text, identity, *, recipe=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise FileExistsError(output)
-    cache_dir = getattr(args, "c1_cache_dir", None)
+    cache_dir = getattr(args, "action_token_cache_dir", None) or getattr(args, "c1_cache_dir", None)
     if cache_dir is not None:
-        if family != "c1":
-            raise ValueError("Only frozen C1 tokens can use the training token cache")
+        if not isinstance(architecture, ActionTokens):
+            raise ValueError("Only frozen action tokens can use the training token cache")
         settings = ("c1-raw-tokens-v1", identity, head.horizon, cfg["policy"]["denoise_steps"], ACTIVE)
         cache_dir = cache_dir / hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
     for step in range(steps):
@@ -159,7 +194,7 @@ def train(args, cfg, model, text, identity, *, recipe=None):
             if cache_dir is None:
                 prior = arch.read_condition(obs, seed=seed + index)
             else:
-                prior = c1_training_tokens(cache_dir, model, head, obs, denoise_steps=arch.denoise_steps, seed=seed + index)
+                prior = cached_action_tokens(cache_dir, model, head, obs, denoise_steps=arch.denoise_steps, seed=seed + index)
             k = 0
             if schedule == "sample_suffix_boundary" and step >= cfg_train["suffix_warmup_steps"] and boundaries.random() < cfg_train["suffix_probability"]:
                 k = boundaries.randrange(1, head.horizon)
@@ -176,7 +211,7 @@ def train(args, cfg, model, text, identity, *, recipe=None):
         optimizer.step()
         print(json.dumps({"step": step+1, "loss": total}), flush=True)
     spec = {**spec, "training": {**cfg_train, "steps": steps, "batch_size": batch}}
-    save_new(dict(schema_version=2, family=family, config=cfg, recipe=spec, identity=identity, bounds=bounds,
+    save_new(dict(schema_version=2, architecture=architecture.name, family=architecture.legacy, config=cfg, recipe=spec, identity=identity, bounds=bounds,
                   source=source, prior_affine=affine, head=head.state_dict(),
                   steps=steps, batch_size=batch, training_windows=dict(mode_counts)), output)
 
@@ -189,44 +224,6 @@ def save_new(payload, output):
         os.link(temp, output)
     finally:
         temp.unlink(missing_ok=True)
-
-
-def sync(device):
-    if torch.device(device).type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-@torch.no_grad()
-def replay(mode, head, prior, reference, states, tick_times=None, *, first_ready=None, coordinates=None):
-    """Return normalized targets by default, or CPU physical targets for timed evaluation."""
-    started = time.perf_counter()
-    def output(target, *, first):
-        value = coordinates.physical(target).cpu() if coordinates is not None else target
-        if first and first_ready is not None:
-            sync(value.device)
-            first_ready.append((time.perf_counter() - started)*1000)
-        return value
-
-    mode = MODE_ALIASES.get(mode, mode)
-    if mode == "hold_latest":
-        return output(states, first=True)
-    if mode == "mapped_action_plan":
-        return output(prior, first=True)
-    block = ActionBlock(head, prior, reference)
-    if mode not in {"b_stale", "latest_joint_each_tick"}:
-        return output(block.targets(states[:, 0], reference, start=0, count=head.horizon), first=True)
-    outputs = []
-    for k in range(head.horizon):
-        if tick_times is not None:
-            sync(reference.device)
-            tick_start = time.perf_counter()
-        observed = states[:, 0] if mode == "b_stale" else states[:, k]
-        reference = block.targets(observed, reference, start=k, count=1)[:, 0]
-        outputs.append(output(reference, first=k == 0))
-        if tick_times is not None:
-            sync(reference.device)
-            tick_times.append((time.perf_counter() - tick_start) * 1000)
-    return torch.stack(outputs, dim=1)
 
 
 @torch.no_grad()
@@ -253,6 +250,29 @@ def evaluate(args, model, text, identity):
     coords = prior_coords.kitchen
     data = KitchenWindows(args.data_root, spec["sources"], "val", head.horizon)
     modes = evaluation_modes(spec, args.mode)
+    paired_probe = args.mode in (None, "paired") and any(m in modes for m in ("adapter_off", "feedback_off"))
+    reference_head = None
+    reference_path = getattr(args, "reference_head_weights", None)
+    reference_origin = "checkpoint_nominal"
+    token_seed = spec["training"]["seed"]
+    if reference_path:
+        if not paired_probe:
+            raise ValueError("A common reference head requires paired feedback diagnostics")
+        baseline = torch.load(reference_path, weights_only=True, map_location="cpu")
+        baseline_spec = checkpoint_recipe(baseline)
+        baseline_source, source = baseline.get("source"), saved.get("source")
+        same_state_scale = (baseline_source is None and source is None) or (
+            baseline_source is not None and source is not None and baseline_source["group"] == source["group"]
+            and torch.equal(baseline_source["state"], source["state"]))
+        if (baseline_spec["architecture"] != ActionTokens.name or not same_state_scale
+                or baseline_spec.get("conditioning", {}).get("feedback_route", "direct") != "direct"
+                or any(spec[key] != baseline_spec[key] for key in ("sources", "instructions"))
+                or any(spec["policy"][key] != baseline_spec["policy"][key] for key in ("denoise_steps", "hz", "horizon"))
+                or not torch.equal(baseline["bounds"], saved["bounds"])):
+            raise ValueError("Expected a matched direct action-token checkpoint for the common reference")
+        reference_head = restore_architecture(baseline, model, identity).head
+        reference_origin = digest(reference_path)
+        token_seed = baseline_spec["training"]["seed"]
     totals = {mode: {} for mode in modes}
     latencies = {mode: [] for mode in modes}
     tick_times = {mode: [] for mode in modes}
@@ -269,7 +289,7 @@ def evaluate(args, model, text, identity):
                 start = time.perf_counter()
                 reference = coords.normalized(initial)[None]
                 obs = observation(rgb, prior_coords.state.normalized(physical_states[0])[None], text[task])
-                prior = arch.read_condition(obs, seed=spec["training"]["seed"] + int(idx))
+                prior = arch.read_condition(obs, seed=token_seed + int(idx))
                 sync(model.device)
                 prior_ms = (time.perf_counter()-start)*1000
             for mode in modes:
@@ -285,6 +305,14 @@ def evaluate(args, model, text, identity):
                     head_ms = (time.perf_counter()-start)*1000
                     latencies[mode].append((prior_ms, head_ms, prior_ms+head_ms, prior_ms+ready[0]))
                 rows[mode].append(motion_metrics(physical, targets, physical_states, saved["bounds"]))
+            if paired_probe:
+                previous = None
+                if reference_head is not None:
+                    fixed_path = replay("block_start", reference_head, prior, reference, states)
+                    previous = torch.cat((reference[:, None], fixed_path[:, :-1]), dim=1)
+                probe = feedback_action_probe(head, prior, reference, states, coords, targets, previous=previous)
+                print(json.dumps(dict(diagnostic="shared_reference_feedback", task=task, source=source,
+                                      episode=ep, window=int(idx), reference_origin=reference_origin, **probe)))
         for mode in modes:
             totals[mode].setdefault(task, []).append(rows[mode])
             print(json.dumps(dict(mode=mode, source=source, episode=ep, task=task,
@@ -315,11 +343,17 @@ def main():
     parser.add_argument("--phoenix-weights", type=Path)
     parser.add_argument("--text-cache", type=Path, help="Existing kitchen T5 cache; otherwise encode four task prompts")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--family", choices=list(LEGACY_NAMES))
-    parser.add_argument("--mode", choices=[*EXECUTIONS, *MODE_ALIASES, "paired", "hold_latest", "b_stale", "mapped_action_plan"])
+    parser.add_argument("--architecture", "--family", choices=list(ARCHITECTURES),
+                        type=lambda value: architecture_type(value).name, help="Architecture for legacy dataset configs")
+    parser.add_argument("--mode", choices=[*EXECUTIONS, *LATENT_CONTROLS, *HISTORY_CONTROLS, *MODE_ALIASES, "paired", "hold_latest", "b_stale", "mapped_action_plan"])
     parser.add_argument("--output", type=Path)
     parser.add_argument("--head-weights", type=Path)
-    parser.add_argument("--c1-cache-dir", type=Path, help="Optional reusable frozen C1 training tokens")
+    parser.add_argument("--reference-head-weights", type=Path,
+                        help="Direct action-token checkpoint supplying identical references across paired evaluations")
+    parser.add_argument("--base-action-token-weights", "--base-c1-weights", type=Path,
+                        help="Direct action-token checkpoint for the frozen-head adapter experiment")
+    parser.add_argument("--action-token-cache-dir", "--c1-cache-dir", type=Path,
+                        help="Per-window .pt token cache for the single-process RGB trainer")
     parser.add_argument("--steps", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--windows", type=int, default=3, help="Held-out windows per episode")
@@ -331,13 +365,15 @@ def main():
     parser.add_argument("--fit-windows", type=int, default=1, help="Fit anchors per training episode")
     parser.add_argument("--fit-episodes-per-task", type=int, help="Use evenly spaced training episodes for a pilot")
     args = parser.parse_args()
+    if args.reference_head_weights and args.operation != "eval":
+        parser.error("--reference-head-weights applies to paired evaluation")
     recipe = None
     if args.recipe:
-        if args.operation == "audit-prior" or any((args.config, args.family, args.source_profile,
+        if args.operation == "audit-prior" or any((args.config, args.architecture, args.source_profile,
                                                    args.source_group, args.raw_slot_control)):
             parser.error("--recipe supplies the architecture, dataset and parent coordinates")
         recipe = resolve_recipe(args.recipe)
-        args.family = architecture_type(recipe["architecture"]).legacy
+        args.architecture = recipe["architecture"]
         if args.operation == "train":
             prior = recipe.get("action_prior", {})
             if prior.get("mapping") == "fitted_affine":
@@ -356,8 +392,12 @@ def main():
         return
     if not (args.model_config and args.phoenix_weights and args.data_root):
         parser.error("Supply --model-config, --phoenix-weights and --data-root")
-    if args.c1_cache_dir and (args.operation != "train" or args.family != "c1"):
-        parser.error("--c1-cache-dir requires train --family c1")
+    needs_base = (args.operation == "train" and recipe is not None
+                  and recipe["training"].get("trainable") == "feedback_adapter")
+    if needs_base != bool(args.base_action_token_weights):
+        parser.error("--base-action-token-weights is required exclusively for latent feedback adapter training")
+    if args.action_token_cache_dir and (args.operation != "train" or args.architecture != ActionTokens.name):
+        parser.error("--action-token-cache-dir requires training the action_token_ode architecture")
     if bool(args.source_profile) != bool(args.source_group):
         parser.error("Supply both --source-profile and --source-group")
     if sum(map(bool, (args.prior_audit, args.source_profile, args.raw_slot_control))) > 1:
@@ -368,8 +408,8 @@ def main():
         parser.error("Choose the parent state scale (--source-profile/--source-group or --prior-audit); --raw-slot-control reproduces the kitchen-scale assumption")
     if args.operation == "eval" and any((args.prior_audit, args.source_profile, args.raw_slot_control)):
         parser.error("eval uses the head checkpoint's saved coordinates")
-    if args.operation == "train" and not (args.output and args.family):
-        parser.error("train requires --family and --output")
+    if args.operation == "train" and not (args.output and args.architecture):
+        parser.error("train requires an architecture and --output")
     if args.operation == "eval" and not args.head_weights:
         parser.error("eval requires --head-weights")
     if any(x is not None and x < 1 for x in (args.steps, args.batch_size, args.windows, args.fit_windows, args.fit_episodes_per_task)):

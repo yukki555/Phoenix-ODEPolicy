@@ -1,0 +1,23 @@
+# Shared optimization and sampling budget for all four history heads and their direct baseline.
+parent:
+  checkpoint: phoenix_joint96_256013
+  frozen: true
+  state_stats_profile: robot37_256013_arx5.json
+  state_stats_group: raw36/arx456_xt_motion_dedup_20260916/arx5
+policy:
+  denoise_steps: 1
+training:
+  trainable: head
+  objective: action_path_mse
+  lr: 0.0001
+  # Windows per optimizer update. In 8-rank cached DDP this means 128 per rank.
+  # The existing RGB runner accumulates this many windows in one process.
+  batch_size: 1024
+  steps: 40000
+  seed: 42
+  observation_schedule: mix_block_start_and_per_tick
+  per_tick_probability: 0.5
+evaluation:
+  executions: [block_start, latest_joint_each_tick, one_tick_delayed]
+  baselines: [feedback_off, hold_latest]
+  paired_windows: true

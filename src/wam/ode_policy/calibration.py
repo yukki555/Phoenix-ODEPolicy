@@ -106,6 +106,7 @@ def trajectory_metrics(pred, target, current, bounds):
 
 @torch.no_grad()
 def audit_prior(args, cfg, model, text, identity):
+    from .architectures import ActionPlanResidual
     from .kitchen import KitchenWindows
     from .phoenix import read_prior
     from types import SimpleNamespace
@@ -117,7 +118,7 @@ def audit_prior(args, cfg, model, text, identity):
     kitchen = JointCoordinates(bounds, model.device)
     source = load_source(args.source_profile, args.source_group, identity) if args.source_profile else None
     coords = PriorCoordinates(kitchen, source)
-    request = SimpleNamespace(family="ab", horizon=horizon)
+    request = SimpleNamespace(architecture=ActionPlanResidual(), horizon=horizon)
     def predict(sample, idx):
         task, rgb, states, _, targets = sample
         obs = observation(rgb, coords.state.normalized(states[0])[None], text[task])

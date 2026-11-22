@@ -4,6 +4,7 @@ import time
 import numpy as np
 import torch
 
+from .architectures import architecture_type
 from .recipe import EXECUTIONS, MODE_ALIASES
 
 
@@ -68,7 +69,9 @@ class KitchenTrial:
         """Score only with the task's prespecified stage names; retain raw latency samples."""
         if type(success) is not bool or not stages or any(type(v) is not bool for v in stages.values()):
             raise ValueError("Expected a boolean task outcome and named boolean stages")
-        return dict(task=self.task, pair_id=self.pair_id, family=self.policy.head.family, head_id=self.head_id,
+        family = self.policy.head.family
+        return dict(task=self.task, pair_id=self.pair_id, architecture=architecture_type(family).name,
+                    family=family, head_id=self.head_id,
                     mode=self.mode, success=success, stages=dict(stages), hz=self.policy.head.hz,
                     tick_ms=list(self.tick_ms), first_target_ms=list(self.first_target_ms),
                     dispatch_failed=self.invalid)
@@ -103,7 +106,8 @@ def summarize_pairs(trials):
         stages, hz = rows[0]["stages"].keys(), rows[0]["hz"]
         ticks = np.asarray([v for r in rows for v in r["tick_ms"]])
         first = [v for r in rows for v in r["first_target_ms"]]
-        result.append(dict(family=family, head_id=head_id, task=task, mode=mode, trials=len(rows),
+        result.append(dict(architecture=architecture_type(family).name, family=family, head_id=head_id,
+                           task=task, mode=mode, trials=len(rows),
                            successes=sum(r["success"] for r in rows), dispatch_failures=sum(r["dispatch_failed"] for r in rows),
                            stages={s: sum(r["stages"][s] for r in rows) for s in stages},
                            ticks=len(ticks), tick_p50_p95_ms=np.percentile(ticks, [50, 95]).tolist() if ticks.size else None,

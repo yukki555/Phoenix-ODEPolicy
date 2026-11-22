@@ -18,7 +18,7 @@ from wam.ode_policy.factory import build_architecture, restore_architecture
 from wam.ode_policy.head import ActionBlock
 from wam.ode_policy.kitchen import JointCoordinates
 from wam.ode_policy.trial import KitchenTrial
-from wam.ode_policy.recipe import CONFIG_ROOT, EXECUTIONS, checkpoint_recipe, evaluation_modes, resolve_recipe
+from wam.ode_policy.recipe import CONFIG_ROOT, EXECUTIONS, HISTORY_CONTROLS, checkpoint_recipe, evaluation_modes, resolve_recipe
 
 
 class RecipeTests(unittest.TestCase):
@@ -31,10 +31,12 @@ class RecipeTests(unittest.TestCase):
 
     def test_three_presets_and_legacy_residual_restore(self):
         files = sorted((CONFIG_ROOT / "recipes").glob("*.yaml"))
-        specs = {s["architecture"]: s for s in map(resolve_recipe, files)}
-        self.assertEqual(set(specs), {"action_plan_residual_ode", "action_token_ode", "action_query_ode"})
-        for spec in specs.values():
-            self.assertEqual(evaluation_modes(spec), [*EXECUTIONS, "hold_latest"])
+        specs = list(map(resolve_recipe, files))
+        self.assertEqual({s["architecture"] for s in specs}, {"action_plan_residual_ode", "action_token_ode", "action_query_ode"})
+        for spec in specs:
+            controls = {"joint_history_attention": HISTORY_CONTROLS, "latent_adapter": ("adapter_off", "direct_c1")}.get(
+                spec.get("conditioning", {}).get("feedback_route"), ())
+            self.assertEqual(evaluation_modes(spec), [*EXECUTIONS, *controls, "hold_latest"])
         cfg = dict(policy=dict(horizon=4, hz=30, solver="euler", denoise_steps=2,
                                context_dim=16, hidden_dim=32), train=dict(seed=42))
         scale = (torch.ones(14)*2, torch.arange(14))
@@ -95,6 +97,33 @@ class RecipeTests(unittest.TestCase):
             if execution == "latest_joint_each_tick":
                 torch.testing.assert_close(block.next_target.call_args.args[2], q+1)
 
+    def test_latent_feedback_reaches_only_causal_targets(self):
+        spec = resolve_recipe(CONFIG_ROOT / "recipes/kitchen_action_tokens_latent_feedback.yaml")
+        head = build_architecture(spec, self.model, PriorCoordinates(self.coords)).head
+        tokens = torch.randn(1, 32, self.model.action_expert.hidden_dim)
+        states = torch.randn(1, 32, 14)
+        reference = torch.randn(1, 14)  # Previous target differs from measured q0.
+        def predict(mode, q):
+            return runner.replay(mode, head, tokens, reference, q)
+
+        torch.testing.assert_close(predict("latest_joint_each_tick", states), predict("adapter_off", states),
+                                   atol=0, rtol=0)
+        head.path_loss(tokens, states, reference, states, feedback=True).backward()
+        self.assertGreater(head.feedback_adapter[-1].weight.grad.norm().item(), 0)
+        self.assertTrue(all(p.grad is None for n, p in head.named_parameters() if not n.startswith("feedback_adapter.")))
+        torch.nn.init.normal_(head.feedback_adapter[-1].weight, std=0.2)
+        changed = states.clone()
+        changed[:, 10] += 1
+        fresh = predict("latest_joint_each_tick", states)
+        altered = predict("latest_joint_each_tick", changed)
+        torch.testing.assert_close(altered[:, :10], fresh[:, :10], atol=0, rtol=0)
+        self.assertGreater((altered[:, 10] - fresh[:, 10]).abs().max().item(), 1e-7)
+        torch.testing.assert_close(predict("adapter_off", states), predict("adapter_off", changed), atol=0, rtol=0)
+        fixed = predict("block_start", states)
+        torch.testing.assert_close(fixed, predict("latest_joint_each_tick", states[:, :1].expand_as(states)))
+        probe = runner.feedback_action_probe(head, tokens, reference, states, self.coords, states[0])
+        self.assertGreater(probe["arm"]["target_change_rms"], 0)
+
     def test_recipe_cli_train_restore_and_paired_replay(self):
         model = self.model
         states = np.random.default_rng(42).normal(size=(20, 14)).astype("float32")
@@ -152,3 +181,41 @@ class RecipeTests(unittest.TestCase):
                 invoke("train","--recipe",str(path),"--output",str(second),"--steps","1","--batch-size","2")
                 self.assertEqual(torch.load(second, weights_only=True)["recipe"]["conditioning"],
                                  {"token_reduction": "temporal_mean_repeat"})
+                latent_recipe = yaml.safe_load((CONFIG_ROOT / "recipes/kitchen_action_tokens_latent_feedback.yaml").read_text())
+                latent_recipe.update(parent=recipe["parent"], policy=recipe["policy"])
+                path.write_text(yaml.safe_dump(latent_recipe))
+                adapted = root / "adapted.pt"
+                init = ["train", "--recipe", str(path), "--output", str(adapted), "--steps", "1", "--batch-size", "2"]
+                with self.assertRaisesRegex(ValueError, "matching token reduction"):
+                    invoke(*init, "--base-c1-weights", str(second))
+                invoke(*init, "--base-c1-weights", str(ckpt))
+                trained = torch.load(adapted, weights_only=True)
+                self.assertEqual(trained["recipe"]["training"]["base_c1_sha256"], identity)
+                for name, weight in saved["head"].items():
+                    torch.testing.assert_close(trained["head"][name], weight, atol=0, rtol=0)
+                self.assertGreater(trained["head"]["feedback_adapter.2.weight"].norm().item(), 0)
+                with model.mot.register_forward_hook(lambda *args: calls.append(1)):
+                    paired = invoke("eval", "--head-weights", str(adapted), "--windows", "1")
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(any(r.get("diagnostic") == "shared_reference_feedback" for r in paired))
+                scores = {r["mode"]: r["arm_rmse"] for r in paired if "window_indices" in r}
+                for base_row, control in zip(episode[:2], ("adapter_off", "direct_c1")):
+                    self.assertEqual(scores[control], base_row["arm_rmse"])
+
+                history_spec = resolve_recipe(
+                    CONFIG_ROOT / "recipes/kitchen_action_tokens_action_feature_field_condition.yaml")
+                recipe["conditioning"] = history_spec["conditioning"]
+                recipe["evaluation"] = history_spec["evaluation"]
+                path.write_text(yaml.safe_dump(recipe))
+                history_weights = root / "joint_history.pt"
+                invoke("train", "--recipe", str(path), "--output", str(history_weights),
+                       "--steps", "1", "--batch-size", "2")
+                with model.mot.register_forward_hook(lambda *args: calls.append(1)):
+                    rows = invoke("eval", "--head-weights", str(history_weights), "--mode", "paired",
+                                  "--reference-head-weights", str(ckpt), "--windows", "1")
+                self.assertEqual(len(calls), 3)  # One additional parent call, shared by both heads and all modes.
+                self.assertEqual({r["mode"] for r in rows if "window_indices" in r},
+                                 set(evaluation_modes(history_spec)))
+                probe = next(r for r in rows if r.get("diagnostic") == "shared_reference_feedback")
+                self.assertIn("delayed_rmse", probe["arm"])
+                self.assertEqual(probe["reference_origin"], identity)

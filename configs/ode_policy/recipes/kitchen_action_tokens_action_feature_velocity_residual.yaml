@@ -1,0 +1,10 @@
+dataset: kitchen
+architecture: action_token_ode
+protocol: kitchen_action_token_posttrain
+conditioning:
+  token_reduction: none
+  feedback_route: joint_history_attention
+  history_feedback:
+    history_length: 4
+    query: action_feature
+    injection: action_velocity_residual

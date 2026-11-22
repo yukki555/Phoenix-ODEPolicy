@@ -10,19 +10,40 @@
 | `action_token_ode` | 末步投影前的整段 action tokens | 14 维绝对参考 | [动作序列](../configs/ode_policy/recipes/kitchen_action_tokens.yaml) |
 | `action_query_ode` | 可学习 query 单次读取当前条件 | 14 维绝对参考 | [单次 query](../configs/ode_policy/recipes/kitchen_action_query.yaml) |
 
-先展开 recipe 即可查看数据切分、父模型、条件、积分变量、训练采样和执行协议。以下命令从仓库根目录运行。
+主实验在 `action_token_ode` 下选择关节历史反馈。每份 recipe 显式指定查询和注入位置，五组复用[同一训练协议](../configs/ode_policy/protocols/kitchen_action_token_posttrain.yaml)。
+
+| 反馈进入的位置 | 动作特征查询 | 步号查询 |
+|---|---|---|
+| 速度场输入 | [主方案](../configs/ode_policy/recipes/kitchen_action_tokens_action_feature_field_condition.yaml) | [步号查询速度场](../configs/ode_policy/recipes/kitchen_action_tokens_block_step_field_condition.yaml) |
+| 动作速度残差 | [动作特征查询残差](../configs/ode_policy/recipes/kitchen_action_tokens_action_feature_velocity_residual.yaml) | [步号查询残差](../configs/ode_policy/recipes/kitchen_action_tokens_block_step_velocity_residual.yaml) |
+
+[直接输入当前关节的基线](../configs/ode_policy/recipes/kitchen_action_tokens_direct_feedback.yaml)使用相同的一步去噪和后训练预算。已有的小样本配置仍保留各自的去噪步数和更新数。
+
+以下命令从仓库根目录运行。训练示例在单进程 RGB 入口做一次小批量功能检查。
 
 ```bash
-recipe=configs/ode_policy/recipes/kitchen_action_tokens.yaml
+recipe=configs/ode_policy/recipes/kitchen_action_tokens_action_feature_field_condition.yaml
 python -m wam.ode_policy.runner resolve --recipe "$recipe"
 common=(--model-config "$PHOENIX_MODEL_CONFIG" --phoenix-weights "$PHOENIX_WEIGHTS" --data-root "$KITCHEN_DATA_ROOT")
-python -m wam.ode_policy.runner train --recipe "$recipe" "${common[@]}" --output runs/action-tokens.pt
-python -m wam.ode_policy.runner eval "${common[@]}" --head-weights runs/action-tokens.pt --windows 3
+python -m wam.ode_policy.runner train --recipe "$recipe" "${common[@]}" --steps 1 --batch-size 2 --output runs/joint-history-smoke.pt
+python -m wam.ode_policy.runner eval "${common[@]}" --head-weights runs/joint-history-smoke.pt --windows 3
 ```
 
-最后一条命令读取 checkpoint 内的协议。对每个窗口只提取一次条件，按 `block_start`、`latest_joint_each_tick` 和 `hold_latest` 分别报告结果。单项评估可使用 `--mode latest_joint_each_tick`。部署从同一 checkpoint 恢复，然后调用 `full_chunk()` 或由控制器逐步调用 `next_target(k, measured, last_sent)`。新 checkpoint 保存解析后的 recipe、实际训练步数和 batch、父模型指纹、输入状态统计，以及残差架构实际使用的动作映射。旧 checkpoint 按保存的 family、映射和统计恢复。
+最后一条命令读取 checkpoint 内的协议。对每个窗口只提取一次条件。历史反馈配方配对回放 `block_start`、`latest_joint_each_tick`、`one_tick_delayed`、`feedback_off` 和 `hold_latest`。另输出共同参考下的单步变化及相对专家的误差。默认采用该 head 关闭反馈后的参考。做跨模型比较时，给各组的 eval 命令传同一个 `--reference-head-weights <直接反馈基线.pt>`，统一使用该基线的块首轨迹及采样种子。单项评估可使用 `--mode latest_joint_each_tick`。部署从同一 checkpoint 恢复，然后调用 `full_chunk()` 或由控制器逐步调用 `next_target(k, measured, last_sent)`。新 checkpoint 保存架构全名、解析后的 recipe、实际训练步数和 batch、父模型指纹、输入状态统计，以及动作计划使用的尺度映射。旧 checkpoint 按保存的 family、映射和统计恢复。
 
-复制动作序列 recipe，将 `conditioning.token_reduction` 从 `none` 改成 `temporal_mean_repeat`，用新输出路径训练。均值消融先沿 32 个时间位置取均值，再重复至原长度，随后执行相同投影、位置编码和 attention。两组可共享 `--c1-cache-dir` 中的原始 tokens。训练步数、batch 和采样设置沿用同一份 recipe。
+已有块首 tokens 时，使用同一 factory 单独构造 head。下面四个张量依次为投影前 tokens 和按厨房坐标归一化的实测序列、上一参考、专家目标，形状分别为 `[B,32,1024]`、`[B,32,14]`、`[B,14]`、`[B,32,14]`。全量分片保存的是物理量，读取端应用训练分位数后再传入后三项。
+
+```python
+from wam.ode_policy.factory import build_head
+from wam.ode_policy.recipe import resolve_recipe
+
+spec = resolve_recipe("configs/ode_policy/recipes/kitchen_action_tokens_action_feature_field_condition.yaml")
+head = build_head(spec, token_width=tokens.shape[-1], device=tokens.device)
+loss = head.path_loss(tokens, measured, last_reference, expert_targets, feedback=True)
+loss.backward()
+```
+
+复制动作序列 recipe，将 `conditioning.token_reduction` 从 `none` 改成 `temporal_mean_repeat`，用新输出路径训练。均值消融先沿 32 个时间位置取均值，再重复至原长度，随后执行相同投影、位置编码和 attention。单进程 RGB 入口的两组可共享 `--action-token-cache-dir` 中的逐窗 `.pt` tokens。训练步数、batch 和采样设置沿用同一份 recipe。
 
 残差 recipe 默认用 `source_physical`。使用拟合映射时，改为 `action_prior.mapping: fitted_affine`，并在同一区段用 `audit`（相对 recipe 的路径）指定已经生成的训练集校准文件，或传入 `--prior-audit`。三组使用相同的父模型 state 编码。仅动作计划使用 action 解码和映射。
 
@@ -38,7 +59,7 @@ python -m wam.ode_policy.runner eval "${common[@]}" --head-weights runs/action-t
 | `ab` | `b` | 使用同一份计划和同一套权重，每个控制周期读取最新实测关节，只生成下一个目标 |
 | `ab` | `b_stale` | 同样逐步调用，持续使用块首关节状态 |
 
-C1 同一 checkpoint 的固定与反馈执行是首轮主对照。C2 使用同一协议，同时比较从块首观测到首个可执行目标的延迟。旧的 `--mode c1` 和 `--mode c2` 仍对应各自的固定状态执行。A/B 作为显式动作先验对照保留。
+上述代号用于复现既有实验。当前主对照采用上表的查询方式与注入位置四种组合。旧的 `--mode c1` 和 `--mode c2` 仍对应各自的固定状态执行。
 
 ## 配置和数据
 
@@ -81,7 +102,7 @@ A/B 可用 `--prior-kind native` 复用审计中的来源统计，或用 `--prio
 
 重复 C1 训练时可以传入 `--c1-cache-dir runs/c1-tokens`。缓存保存冻结骨干输出投影前的原始 tokens，按父模型身份、时域、去噪设置、种子和实际条件内容区分。C2 每个窗口都重新计算 query 条件并反向传播；计时回放始终现场计算块首条件。
 
-正式比较分别以 `--family ab`、`--family c1`、`--family c2` 训练，使用独立输出文件。相同随机种子产生相同训练窗口顺序。每个样本独立做 Phoenix 前向，用梯度累积达到配置中的有效 batch。checkpoint 保存新增权重、实际更新数、归一化、配置和父配置/权重/文本缓存指纹。训练不覆盖已有输出。评估每个留出 episode 选相同的均匀分布窗口，逐任务报告 12 臂关节和 2 夹爪的原生单位 RMSE，各 episode 等权。默认每条轨迹三个窗口。
+单进程 RGB 训练入口使用各自的 `--recipe` 和独立输出文件。使用旧式数据配置时也可显式传 `--architecture action_token_ode` 等架构全名。相同随机种子产生相同训练窗口顺序。每个样本独立做 Phoenix 前向，用梯度累积达到配置中的有效 batch。checkpoint 保存新增权重、实际更新数、归一化、配置和父配置/权重/文本缓存指纹。训练不覆盖已有输出。评估每个留出 episode 选相同的均匀分布窗口，逐任务报告 12 臂关节和 2 夹爪的原生单位 RMSE，各 episode 等权。默认每条轨迹三个窗口。
 
 配对回放的 `hold_latest` 直接输出各步 q[k]。在该数据中增量误差 (预测−q[k])−(标签−q[k]) 等于位置误差，因此另报活动关节的增量方向、预测及专家的平均绝对步长。按关节、按窗口报告活动范围与主要转折。活动阈值取该关节训练分位跨度的 1%（下限 1e-6）。主要转折取相对两端均有最大突出幅度的内部峰或谷，超过阈值才计数，比较同类型转折的时刻。夹爪沿用每窗、每侧、每方向首次越过训练区间中点的计数。时机指标都附分母，零匹配显示 null。位置 RMSE 按 episode 等权，运动统计按有效样本或事件计权。
 
@@ -145,3 +166,67 @@ PYTHONPATH=src python -m unittest discover -s tests -p 'test_ode*.py'
 | 用 16 个训练窗口拟合仿射映射 | 0.08057 | 12/22 |
 
 翻蛋的仿射校准误差为 0.08195 rad，保持姿态为 0.09255；黄瓜的对应结果为 0.05984 和 0.05074。跨任务的轨迹收益尚未确立。22 个窗口只有一个真实夹爪过阈事件，四种输出均未捕获，无法估计匹配事件的开合时间差。该检查只覆盖各示范的一个相位；可在固定定义下增加窗口，分开评估明显运动、接触与开合阶段。
+
+## 2026-11-21 实验记录与 TODO：C1 参考恢复和逐拍反馈
+
+C1 学习参考目标的速度场，以 30 Hz 递推 32 步，用整条 14 维参考轨迹的 MSE 监督。在线跨块从控制器确认接受的上一目标接续，同时单独传入实测状态。当前配方从示范参考起步，每个窗口以 0.5 概率使用逐拍实测，其余窗口复用块首状态。八窗口拟合则对每个窗口同时计算两路损失，各占一半。两路均使用原始专家轨迹，夹爪与臂关节共同积分。[积分与损失](../src/wam/ode_policy/head.py) · [C1 配方](../configs/ode_policy/recipes/kitchen_action_tokens.yaml) · [控制器确认逻辑](../src/wam/ode_policy/trial.py)
+
+- [x] **建立八窗口 C1 的反馈基线。** 用拟合 1,200 次更新的同一份权重，回放拟合窗口、同 episode 的其余窗口及 22 条独立留出 episode。留出集各任务内，取块首模式的参考目标与示范实测状态偏差最高的四分之一时刻。固定 tokens、上一参考和块内步号后，最新状态相对块首状态仅降低下一目标的臂关节 RMSE 0.0043°。三路整块各自递推时，最新、滞后一拍、块首的 RMSE 分别为 20.1119°、20.1160°、20.1573°。这些状态来自专家示范。工作区实验记录保存在与仓库并列的 `artifacts/phoenix-c1-q-feedback-20261121/README.md` 和 `artifacts/phoenix-c1-fit-episode-feedback-20261121/README.md`。
+- [ ] **检验初始参考偏移后的恢复能力。** 以当前无扰动 C1 为对照，按 ImageWAM 的设置试验：以 0.5 概率扰动块首参考，令 \(r'_0=r_0+\delta\)，第 \(j\) 步的监督改为 \(r_j^{*\prime}=r_j^*+0.7^j\delta\)，\(j=1,\ldots,32\)。实测序列和块首 tokens 沿用同一示范。实验前记录扰动维度、单位及按关节选取的幅度，两组匹配训练窗口、预算和反馈采样。在相同留出窗口上施加同一批偏移，报告各步对恢复目标的误差、回到原示范的误差曲线，以及零扰动时的轨迹质量。[ImageWAM 扰动配置](https://github.com/NTUMARS/ODE-POLICY/blob/wam-imagewam/wam/src/ode_imagewam/configs/libero_ode.yaml) · [恢复监督实现](https://github.com/NTUMARS/ODE-POLICY/blob/wam-imagewam/wam/src/ode_imagewam/model.py)
+- [ ] **优先用正式四任务 C1 权重复测逐拍反馈。** 先在原留出窗口上固定 tokens、上一参考 \(r_k\) 和步号 \(k\)，仅替换最新 \(q_k\)、滞后一拍 \(q_{k-1}\) 或块首 \(q_0\)，记录下一目标的变化量和对专家动作的误差。随后从同一初值做三路整块递推，分别报告全部时刻和高偏差时刻的逐任务结果，保留保持最新姿态基线。若完成扰动训练，对新权重重复同一评估，分别记录参考恢复收益和最新实测带来的收益。真机闭环收益沿用上文的配对协议验证。
+
+### 独立消融：用逐拍反馈修正 C1 latent
+
+- [x] **实现独立配方与动作传递检查。** 从直接输入关节状态的 C1 checkpoint 开始，冻结 Phoenix、token reader 和速度场，只训练两层 MLP 适配器。每拍从同一份块首 tokens 读取当前条件 $h_k$，用 $h_k,r_k,q_k,r_k-q_k,k/32$ 预测 $\Delta h_k$。冻结的速度场读取 $h_k+\Delta h_k$、块首实测 $q_0$、上一已下发参考 $r_k$ 与块内进度，用一个 Euler 步输出下一物理目标。每拍独立修正 latent，预测目标沿时间接续。适配器末层零初始化，训练开始时可复现原 C1 固定块首状态的动作。[latent 配方](../configs/ode_policy/recipes/kitchen_action_tokens_latent_feedback.yaml) · [直接反馈配方](../configs/ode_policy/recipes/kitchen_action_tokens.yaml)
+- [x] **八窗口拟合消融（2026-11-21）。** 从原拟合 C1 各追加 1,200 次更新，两个分支共用训练窗口、顺序和学习率。采用原 C1 共同上一参考，在每任务偏差最高的四分之一时刻（共 64 拍），latent 将块首反馈换为最新反馈时下一目标改变 0.01039° RMS，整块高偏差 RMSE 从 1.00046° 升至 1.02164°。等更新数的直接反馈 C1 单步改变 0.01177°，整块高偏差 RMSE 从 0.93081° 降至 0.92066°。两组全部 256 拍的最新反馈 RMSE 分别为 0.73047° 和 0.66797°。这八窗口中没有时刻达到独立留出集各任务的高偏差阈值。工作区原始轨迹、权重和报告在 `artifacts/phoenix-c1-latent-fit8-20261121/`。
+- [x] **八窗口从头训练配对消融（2026-11-21）。** 两种反馈路径各训练完整 head，三个种子分别配对，共享参数初值和窗口顺序逐组一致。每组 2,400 次更新。直接反馈和 latent 的全时刻最新状态 RMSE 分别为 0.63920° 和 0.63282°。沿用相同 64 个高偏差时刻，最新状态相对各自块首状态的整块 RMSE 收益分别为 +0.01057° 和 −0.01781°，三个种子的收益符号均一致。详见工作区 `artifacts/phoenix-c1-scratch-fit8-20261121/README.md`。
+- [ ] **用正式四任务权重完成配对消融。** 在相同窗口、初值、tokens 和种子下比较下表各路。新增适配器有额外的训练预算。报告起始 C1 的 checkpoint 指纹、适配器更新数及逐任务结果。若比较同预算微调的最终性能，再给直接反馈 C1 同等追加预算。
+- [ ] **验证动作变化的方向和大小。** 配对回放逐窗输出 `diagnostic=shared_reference_feedback`。每拍固定原 C1 块首模式生成的上一参考、tokens 和步号，只切换适配器的 $q_0/q_k$。`target_change_rms` 衡量下一动作的实际变化。`fixed_rmse` 和 `latest_rmse` 分别衡量两种动作对下一拍示范的误差。臂用弧度、夹爪用原开度单位。结合整块各自递推的 RMSE、转折和夹爪事件评估收益。高偏差子集沿用上节的共同参考和分组定义，另行分层统计。软件因果检查从 $k=10$ 才替换实测，前十个动作应逐元素一致，已具备非零反馈响应的适配器应在第十一个动作出现变化。[回放实现](../src/wam/ode_policy/runner.py) · [回归测试](../tests/test_ode_recipes.py)
+
+| 配对回放模式 | 适配器输入 | 速度场直接读取的实测 | 用途 |
+|---|---|---|---|
+| `adapter_off` | 关闭 | 块首 $q_0$ | 复现起始 C1 的固定状态轨迹 |
+| `direct_c1` | 关闭 | 最新 $q_k$ | 复现同一起始 C1 原有的直接反馈轨迹 |
+| `block_start` | 块首 $q_0$ | 块首 $q_0$ | 量化新增参数在没有新观测时的贡献 |
+| `latest_joint_each_tick` | 最新 $q_k$ | 块首 $q_0$ | 与上一行相减，量化最新反馈经 latent 传递到动作的贡献 |
+| `hold_latest` | — | — | 直接输出示范当前实测姿态 |
+
+2026-11-21 本地兼容性检查使用已有八窗口 C1 权重（SHA-256 前缀 `d6158f11a957`）、一条保存的示范状态序列和固定随机 tokens。在相同输入下，`adapter_off`、`direct_c1` 分别与原 head 对应路径逐元素一致。零初始化的适配器也精确复现块首路径。更新一次适配器后，原 head 权重逐元素保持一致，固定参考时替换反馈可产生非零关节目标变化。此检查覆盖动作传递和旧权重兼容性，留出集动作质量另按上述 TODO 评估。
+
+沿用“按架构和实验配置运行”中的 `common` 参数。训练需指定实际的起始 C1 权重。生成的 checkpoint 保存冻结 head、适配器和起始权重 SHA-256，可直接用于回放及原有在线接口。
+
+```bash
+recipe=configs/ode_policy/recipes/kitchen_action_tokens_latent_feedback.yaml
+python -m wam.ode_policy.runner train --recipe "$recipe" "${common[@]}" \
+  --base-c1-weights "$C1_CHECKPOINT" --output runs/c1-latent-feedback.pt
+python -m wam.ode_policy.runner eval "${common[@]}" --head-weights runs/c1-latent-feedback.pt --mode paired
+```
+
+## 2026-11-22 实验记录：C1 去噪步数
+
+在原四任务八窗口上，分别用 1、2、5、10 步原生联合去噪的末次前向提取 32 个 action tokens。每档三个配对种子，各从头训练直接反馈 C1 head 2,400 次。本轮同卡交错计时中，首目标 P50 依次为 403、678、1294、2272 ms。逐拍反馈下，1 步和 10 步的平均活动关节幅度比分别为 1.014 和 1.027，匹配主要转折分别为 12/12/11 与 11/11/11（每个种子共 13 个）。1 步的转折时机误差比 10 步多 0.20 拍。训练与评估使用相同窗口和采样噪声，独立留出集仍待验证。工作区的逐种子结果、额外转折统计、原始计时与权重在 `artifacts/phoenix-c1-denoise-fit8-20261122/`。
+
+## 四拍关节反馈的主实验设计
+
+每块用冻结的 Joint96 step 256013 做一步联合去噪，保留全部 32 个输出投影前的 action tokens。每拍从整段 tokens 读出当拍特征 $h_k$。四个实验都用 $h_k$、块首实测 $q_0$、当前参考 $r_k$ 和步号预测名义动作。每个实验从头训练新增 head，各任务共享。直接将 $q_k$ 输入速度场的 C1 单列为基线。
+
+| 反馈进入动作的位置 | 用当拍动作特征查询历史 | 用块内步号查询历史 |
+|---|---|---|
+| 速度场条件 | 以 $h_k$ 为 query，读出的 $c_k$ 作为速度场的额外输入 | 以可学习的步号嵌入为 query，其余相同 |
+| 动作空间速度残差 | 以 $h_k$ 为 query，将 $c_k$ 解码为 14 维速度，加到名义速度上 | 以可学习的步号嵌入为 query，其余相同 |
+
+历史保留本块已观测的最近最多四条 $(q_i,r_i-q_i)$，每条带相对拍龄。$r_i$ 是取得 $q_i$ 时已经生效的参考。训练时使用该路当时递推的参考，在线时使用控制器确认接受的目标。第 $k$ 拍读取历史后仅推进 $r_{k+1}=r_k+v_k/30$。关闭反馈时，条件组使用 $c_k=0$，残差组显式跳过残差解码器，两组各自复现本模型的名义输出。固定块首实测是另一项实验，反馈读取仍开启。
+
+对照约定如下。最新反馈使用截至 $k$ 的历史。滞后一拍只使用截至 $k-1$ 的至多四条同拍实测与参考，并按原始时间戳计算拍龄。每块首拍三路均可见 $q_0$。固定块首实测沿用八窗口原型的做法，在每个历史槽输入 $(q_0,r_i-q_0)$。此时的差值表示当前参考相对保持读数的偏移。关闭反馈单独检查名义路径的一致性。
+
+在同一批留出窗口上做两种回放。单步诊断固定窗口 tokens、步号和整段共同参考历史，分别记录下一目标的改变幅度和相对专家的误差改善。整块回放从同一参考起步，三路各自递推 32 拍。留出集分析沿用每任务共同参考与真实示范状态的臂关节偏差最高四分之一作为共享高偏差子集，保留保持最新姿态基线。同行比较反馈查询方式，同列比较注入位置。四组已接入 factory 并在八窗口缓存上验证前反向。留出集收益和真机闭环收益待测。
+
+## 全量缓存后训练的 batch 计划
+
+四任务一步去噪缓存核验后，按 8 卡同步训练 C1 head。正式实验使用全局 batch **1,024 个窗口**，每卡 128 个窗口，一次同步更新，无梯度累积。逐拍反馈的四组消融及直接输入实测状态的 C1 基线使用相同 batch、采样顺序和优化预算。同一窗口分别用固定和逐拍实测展开时，样本预算只计一次。
+
+正式训练前，在相同 batch 下从真实共享分片短跑。预热后记录稳定窗口吞吐、单次更新耗时和显存峰值，并检查 loss 有限、跨卡梯度同步和 checkpoint 续训。按这次短跑的端到端速度估算全量耗时。
+
+每组 40,000 次 optimizer 更新，共处理 4,096 万个窗口样本，含重复采样。在第 1,250 和 5,000 次更新保存检查点，分别对齐先前 batch 32 和 128 各训练 40,000 次的窗口预算（128 万和 512 万）。
+
+2026-11-23 在原八个拟合窗口上测了两路配对展开、FP32 全路径反传与 AdamW 更新。上海 L20Z 的单进程分配器限额为 24 GiB，使用当拍 token 查询的两种四拍历史反馈原型均通过每卡 4,864 窗，下一测试档 5,120 窗 OOM。乌兰察布 A100 八卡 DDP 在全局 4,096 窗通过，历史反馈原型每卡峰值保留显存约 2.50 GiB。输入常驻 GPU，实际共享分片读取吞吐要另测。原始结果位于工作区 `artifacts/phoenix-c1-batch-vram-20261123/README.md`。

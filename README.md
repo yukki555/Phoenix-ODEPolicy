@@ -40,8 +40,8 @@ Available and planned releases include:
 
 ## Four-task action ODE post-training
 
-This branch trains action ODE heads on four kitchen tasks with frozen Phoenix. Each C1 or C2 checkpoint supports paired block-start and per-tick joint-feedback evaluation.
-Start with the [paired action-token recipe](configs/ode_policy/recipes/kitchen_action_tokens.yaml) and the [training, replay and per-tick inference guide](docs/KITCHEN_ODE.md).
+This branch trains action ODE heads on four kitchen tasks with frozen Phoenix. The main experiment uses one-step action tokens to query the four most recent joint measurements and tracking errors. The retrieved feedback conditions the velocity field at each control tick.
+Start with the [action-feature query and field-conditioning recipe](configs/ode_policy/recipes/kitchen_action_tokens_action_feature_field_condition.yaml), the [matched direct-feedback baseline](configs/ode_policy/recipes/kitchen_action_tokens_direct_feedback.yaml), and the [training, replay and per-tick inference guide](docs/KITCHEN_ODE.md).
 
 ## Model Zoo
 

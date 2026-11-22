@@ -1,0 +1,23 @@
+dataset: kitchen
+architecture: action_token_ode
+parent:
+  checkpoint: phoenix_joint96_256013
+  frozen: true
+  state_stats_profile: robot37_256013_arx5.json
+  state_stats_group: raw36/arx456_xt_motion_dedup_20260916/arx5
+conditioning:
+  token_reduction: none
+  feedback_route: latent_adapter
+training:
+  trainable: feedback_adapter
+  objective: action_path_mse
+  lr: 0.0001
+  batch_size: 32
+  steps: 1000
+  seed: 42
+  observation_schedule: mix_block_start_and_per_tick
+  per_tick_probability: 0.5
+evaluation:
+  executions: [block_start, latest_joint_each_tick]
+  baselines: [adapter_off, direct_c1, hold_latest]
+  paired_windows: true
