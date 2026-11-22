@@ -16,8 +16,8 @@ import yaml
 from .calibration import PriorCoordinates, audit_prior, load_source
 from .factory import build_architecture, make_head, restore_architecture
 from .architectures import ARCHITECTURES, ActionPlanResidual, ActionTokens, architecture_type
-from .recipe import (EXECUTIONS, HISTORY_CONTROLS, LATENT_CONTROLS, MODE_ALIASES, checkpoint_recipe, evaluation_modes, legacy_config,
-                     legacy_recipe, resolve_recipe)
+from .recipe import (EXECUTIONS, HISTORY_CONTROLS, LATENT_CONTROLS, MODE_ALIASES, apply_learning_rate,
+                     checkpoint_recipe, evaluation_modes, legacy_config, legacy_recipe, resolve_recipe)
 from .metrics import motion_metrics, summarize
 from .replay import feedback_action_probe, replay, sync
 from .kitchen import ACTIVE, JointCoordinates, KitchenWindows, observation
@@ -208,9 +208,12 @@ def train(args, cfg, model, text, identity, *, recipe=None):
                 raise ValueError("Nonfinite ODE path loss")
             (loss / batch).backward()
             total += loss.item() / batch
+        lr = apply_learning_rate(optimizer, cfg_train, step + 1)
         optimizer.step()
-        print(json.dumps({"step": step+1, "loss": total}), flush=True)
-    spec = {**spec, "training": {**cfg_train, "steps": steps, "batch_size": batch}}
+        print(json.dumps({"step": step+1, "loss": total, "lr": lr}), flush=True)
+    # Keep the configured LR horizon in the recipe even for a short run; the checkpoint records actual steps.
+    budget = cfg_train["steps"] if cfg_train.get("lr_scheduler") else steps
+    spec = {**spec, "training": {**cfg_train, "steps": budget, "batch_size": batch}}
     save_new(dict(schema_version=2, architecture=architecture.name, family=architecture.legacy, config=cfg, recipe=spec, identity=identity, bounds=bounds,
                   source=source, prior_affine=affine, head=head.state_dict(),
                   steps=steps, batch_size=batch, training_windows=dict(mode_counts)), output)

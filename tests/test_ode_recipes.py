@@ -18,7 +18,8 @@ from wam.ode_policy.factory import build_architecture, restore_architecture
 from wam.ode_policy.head import ActionBlock
 from wam.ode_policy.kitchen import JointCoordinates
 from wam.ode_policy.trial import KitchenTrial
-from wam.ode_policy.recipe import CONFIG_ROOT, EXECUTIONS, HISTORY_CONTROLS, checkpoint_recipe, evaluation_modes, resolve_recipe
+from wam.ode_policy.recipe import (CONFIG_ROOT, EXECUTIONS, HISTORY_CONTROLS, apply_learning_rate,
+                                   checkpoint_recipe, evaluation_modes, resolve_recipe)
 
 
 class RecipeTests(unittest.TestCase):
@@ -28,6 +29,23 @@ class RecipeTests(unittest.TestCase):
         self.model = TinyPhoenix()
         self.bounds = torch.stack((torch.zeros(14), torch.ones(14)))
         self.coords = JointCoordinates(self.bounds, "cpu")
+
+    def test_shared_learning_rate_at_optimizer_update_boundaries(self):
+        specs = [resolve_recipe(path) for path in (CONFIG_ROOT / "recipes").glob("*.yaml")]
+        paired = [s["training"] for s in specs if s.get("protocol") == "kitchen_action_token_posttrain"]
+        self.assertEqual(len(paired), 5)
+        optimizer = SimpleNamespace(param_groups=[{}])
+        for training in paired:
+            self.assertEqual((training["steps"], training["batch_size"]), (40000, 1024))
+            for step, expected in ((1, 2e-7), (499, 9.98e-5), (500, 1e-4),
+                                   (20250, 5.5e-5), (40000, 1e-5)):
+                apply_learning_rate(optimizer, training, step)
+                self.assertAlmostEqual(optimizer.param_groups[0]["lr"], expected, places=15)
+            self.assertLess(apply_learning_rate(optimizer, training, 501), training["lr"])
+        for spec in specs:
+            if "protocol" not in spec:
+                training = spec["training"]
+                self.assertEqual(apply_learning_rate(optimizer, training, 1), training["lr"])
 
     def test_three_presets_and_legacy_residual_restore(self):
         files = sorted((CONFIG_ROOT / "recipes").glob("*.yaml"))
@@ -206,10 +224,14 @@ class RecipeTests(unittest.TestCase):
                     CONFIG_ROOT / "recipes/kitchen_action_tokens_action_feature_field_condition.yaml")
                 recipe["conditioning"] = history_spec["conditioning"]
                 recipe["evaluation"] = history_spec["evaluation"]
+                recipe["training"] = history_spec["training"]
                 path.write_text(yaml.safe_dump(recipe))
                 history_weights = root / "joint_history.pt"
-                invoke("train", "--recipe", str(path), "--output", str(history_weights),
-                       "--steps", "1", "--batch-size", "2")
+                updates = invoke("train", "--recipe", str(path), "--output", str(history_weights),
+                                 "--steps", "1", "--batch-size", "2")
+                self.assertAlmostEqual(updates[-1]["lr"], 2e-7, places=15)
+                short_run = torch.load(history_weights, weights_only=True)
+                self.assertEqual((short_run["steps"], short_run["recipe"]["training"]["steps"]), (1, 40000))
                 with model.mot.register_forward_hook(lambda *args: calls.append(1)):
                     rows = invoke("eval", "--head-weights", str(history_weights), "--mode", "paired",
                                   "--reference-head-weights", str(ckpt), "--windows", "1")

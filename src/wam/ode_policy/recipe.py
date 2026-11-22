@@ -1,5 +1,6 @@
 """Compose human-readable experiments and adapt the original kitchen CLI/checkpoints."""
 from copy import deepcopy
+import math
 from pathlib import Path
 
 import yaml
@@ -82,6 +83,25 @@ def validate_conditioning(arch, conditioning):
     validate_history_feedback(**history)
 
 
+def apply_learning_rate(optimizer, training, update):
+    """Set the LR for this one-based optimizer update, including the first one after resume."""
+    peak = training["lr"]
+    lr = peak
+    schedule = training.get("lr_scheduler")
+    if schedule is not None:
+        warmup = schedule["warmup_steps"]
+        if update <= warmup:
+            lr = peak * (update / warmup)
+        else:
+            total = training["steps"]
+            progress = (min(update, total) - warmup) / (total - warmup)
+            floor = schedule["min_lr"]
+            lr = floor + (peak - floor) * (1 + math.cos(math.pi * progress)) / 2
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
 def validate_recipe(spec):
     arch = architecture_type(spec["architecture"])
     if spec["parent"]["frozen"] is not True or spec["parent"]["checkpoint"] != "phoenix_joint96_256013":
@@ -105,6 +125,16 @@ def validate_recipe(spec):
         raise ValueError("Unsupported training objective or observation schedule")
     if t["steps"] < 1 or t["batch_size"] < 1 or t["lr"] <= 0:
         raise ValueError("Training steps, batch size, and learning rate must be positive")
+    schedule = t.get("lr_scheduler")
+    if schedule is not None:
+        if not isinstance(schedule, dict) or schedule.get("type") != "linear_warmup_cosine":
+            raise ValueError("Expected a linear_warmup_cosine learning rate schedule")
+        warmup = schedule.get("warmup_steps")
+        floor = schedule.get("min_lr")
+        if type(warmup) is not int or not 1 <= warmup < t["steps"]:
+            raise ValueError("warmup_steps must be positive and shorter than the training budget")
+        if not isinstance(floor, (int, float)) or not 0 < floor <= t["lr"]:
+            raise ValueError("min_lr must be positive and at most the peak learning rate")
     if t["observation_schedule"] == "sample_suffix_boundary" and (
         t["suffix_warmup_steps"] < 0 or not 0 <= t["suffix_probability"] <= 1
         or not 0 <= t["model_boundary_probability"] <= 1

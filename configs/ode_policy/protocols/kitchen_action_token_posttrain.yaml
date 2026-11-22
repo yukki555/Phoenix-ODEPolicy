@@ -10,6 +10,10 @@ training:
   trainable: head
   objective: action_path_mse
   lr: 0.0001
+  lr_scheduler:
+    type: linear_warmup_cosine
+    warmup_steps: 500
+    min_lr: 0.00001
   # Windows per optimizer update. In 8-rank cached DDP this means 128 per rank.
   # The existing RGB runner accumulates this many windows in one process.
   batch_size: 1024
